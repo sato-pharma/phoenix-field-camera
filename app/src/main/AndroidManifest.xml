@@ -8,9 +8,11 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- Only to read Phoenix's clock when there is a signal; no photo, location or name ever leaves the phone. -->
+    <!-- Phoenix's clock, the rep's sign-in and the visits he took: sent to Phoenix only, over HTTPS. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 2.1: one quiet "Visits waiting to be sent" notice, and the 22:00 reminder while visits are still on the phone. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- To see whether a fake-location app is installed and switched on. The app is shared by hand, never on Play. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
 

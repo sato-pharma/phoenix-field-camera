@@ -39,6 +39,7 @@ object PhoenixApi {
         return if (expires > System.currentTimeMillis()) token else null
     }
 
+    /** The login id the rep typed (an HR ID, or a TEST- id for a test account). */
     fun hrId(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("hrId", "") ?: ""
 
     fun signedInOnce(context: Context): Boolean = hrId(context).isNotEmpty()
@@ -58,8 +59,9 @@ object PhoenixApi {
         }
         val expires = runCatching { Instant.parse(reply.body.optString("expiresAt")).toEpochMilli() }
             .getOrDefault(System.currentTimeMillis() + 11L * 3_600_000L)
-        val user = reply.body.optJSONObject("user")
-        val id = (user?.optString("hrId")?.takeIf { it.isNotBlank() } ?: hrId).trim().uppercase()
+        // The typed login id, kept for the sign-in screen. A test account (TEST-...) has no HR ID of its own; the seal
+        // carries the HR ID Phoenix's pack names (MainActivity.repHrId), never this one.
+        val id = hrId.trim().uppercase()
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("token", token)
             .putLong("expiresMs", expires)
@@ -110,6 +112,21 @@ object PhoenixApi {
             .putString("bootId", bootId(context))
             .apply()
     }
+
+    /**
+     * Refreshes the anchor whenever Phoenix answers and the one held is more than [ANCHOR_FRESH_MS] old, or from
+     * before the phone last restarted (camera 2.1: a visit is dated from the newest anchor possible).
+     */
+    fun refreshAnchorIfOld(context: Context, seatId: String) {
+        val prefs = context.getSharedPreferences("anchor", Context.MODE_PRIVATE)
+        val sameBoot = prefs.getString("bootId", null) == bootId(context)
+        val ended = prefs.getLong("ended", -1L)
+        val now = SystemClock.elapsedRealtime()
+        if (sameBoot && ended in 0..now && now - ended < ANCHOR_FRESH_MS) return
+        refreshAnchor(context, seatId)
+    }
+
+    private const val ANCHOR_FRESH_MS = 5L * 60_000L
 
     /** The offline clock for a shutter at this uptime, or null when there is no anchor from since the phone started. */
     fun offlineClock(context: Context, shutterElapsedMs: Long): JSONObject? {

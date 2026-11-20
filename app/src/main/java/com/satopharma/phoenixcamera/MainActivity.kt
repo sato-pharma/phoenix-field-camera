@@ -52,7 +52,6 @@ import androidx.core.widget.doAfterTextChanged
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.security.SecureRandom
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -62,7 +61,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * The Phoenix Camera 2.0: the rep's own visit app for a clinic with no network (owner, 20 Nov 2026).
+ * The Phoenix Camera 2.1: the rep's own visit app for a clinic with no network (owner, 20 Nov 2026).
  *
  * He signs in with his HR ID and Phoenix password once, with network; the phone then keeps his list, today's plan and
  * the line's products. With no network he chooses Planned or Unplanned, picks the customer, fills the same visit the
@@ -79,16 +78,10 @@ import java.util.concurrent.Executors
 class MainActivity : ComponentActivity() {
 
     private companion object {
-        /** A reading this accurate (Android's 68% radius; 98% within about 37 m) seals the photo at once. */
-        const val EXACT_M = 20f
-        /** The least accurate reading a photo may carry (98% within about 74 m). Phoenix refuses anything wider. */
-        const val MAX_M = 40f
-        /** A reading this fresh at the shutter seals the photo at once. */
+        /** A reading this fresh and within [Pending.EXACT_M] shows "location locked" on the camera screen. */
         const val INSTANT_AGE_MS = 15_000L
-        /** After the shutter the location has this long to lock before the photo is given up. */
-        const val LOCK_WAIT_MS = 20_000L
-        /** The oldest reading a photo may carry. Phoenix allows two minutes. */
-        const val BEFORE_MS = 120_000L
+        /** How often a visit waiting for its place looks at the newest readings. */
+        const val PENDING_EVERY_MS = 2_000L
         /** How often the phone asks whether Phoenix answers. */
         const val NETWORK_EVERY_MS = 15_000L
         /** With network, the list and the time anchor are read again at most this often. */
@@ -96,14 +89,25 @@ class MainActivity : ComponentActivity() {
     }
 
     /** What the phone knew at the instant of the shutter. */
-    private class Shot(val shutterNanos: Long, val phoneMs: Long, val satellitesUsed: Int, val satellitesSeen: Int)
+    private class Shot(
+        val shutterNanos: Long,
+        val phoneMs: Long,
+        val satellitesUsed: Int,
+        val satellitesSeen: Int,
+        val satelliteMs: Long?,
+        val networkMs: Long?,
+        val offline: JSONObject?,
+        val bootId: String,
+    )
 
     /** The visit a photo is being taken for. */
     private class VisitDraft(val customer: PackCustomer, val planned: Boolean, val body: JSONObject) {
         val visitId: String = UUID.randomUUID().toString()
+        /** What the photo shows: the place, or, for a customer with no place yet, one of the four doctor's-name photos. */
+        var photoKind: String = "place"
     }
 
-    private enum class Screen { START, LOGIN, HOME, LIST, FORM, CAMERA, OTHER }
+    private enum class Screen { START, LOGIN, HOME, LIST, FORM, KIND, CAMERA, OTHER }
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val net: ExecutorService = Executors.newSingleThreadExecutor()
@@ -137,10 +141,17 @@ class MainActivity : ComponentActivity() {
             ticker.postDelayed(this, NETWORK_EVERY_MS)
         }
     }
+    private var pendingBusy = false
+    /** While the app is open, a visit waiting for its place takes the first good reading as it arrives. */
+    private val pendingLoop = object : Runnable {
+        override fun run() {
+            advancePending()
+            ticker.postDelayed(this, PENDING_EVERY_MS)
+        }
+    }
 
     private val cairo = ZoneId.of("Africa/Cairo")
     private val stampTime = DateTimeFormatter.ofPattern("d MMM yyyy · HH:mm:ss", Locale.ENGLISH)
-    private val fileTime = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ENGLISH)
 
     // ── The Phoenix identity ─────────────────────────────────────────────────────────────────────────────────
     private val navy = Color.rgb(11, 31, 58)
@@ -163,16 +174,27 @@ class MainActivity : ComponentActivity() {
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { showStart() }
 
+    /** The camera and the location; on Android 13 and later also the notifications that say visits are waiting. */
+    private fun asked(): Array<String> {
+        val list = mutableListOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 33) list += Manifest.permission.POST_NOTIFICATIONS
+        return list.toTypedArray()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        dropExpiredPhotos()
-        worker.execute { PhoenixClock.refresh(this) }
+        worker.execute {
+            dropOrphanPhotos()
+            PhoenixClock.refresh(this)
+            Notifier.refresh(this)
+        }
+        SendWork.schedule(this)
         showSplash()
-        permissions.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION))
+        permissions.launch(asked())
     }
 
     override fun onResume() {
@@ -180,12 +202,32 @@ class MainActivity : ComponentActivity() {
         startWatch()
         ticker.removeCallbacks(networkLoop)
         ticker.post(networkLoop)
+        ticker.removeCallbacks(pendingLoop)
+        ticker.post(pendingLoop)
     }
 
     override fun onPause() {
         watch?.stop()
         ticker.removeCallbacks(networkLoop)
+        ticker.removeCallbacks(pendingLoop)
         super.onPause()
+    }
+
+    /** Seals every pending visit whose place has arrived (or whose window has passed) and sends it on its way. */
+    private fun advancePending() {
+        if (pendingBusy) return
+        pendingBusy = true
+        val current = watch
+        worker.execute {
+            try {
+                if (Pending.any(this) && Pending.advance(this, current) > 0) {
+                    SendWork.kick(this)
+                    Notifier.refresh(this)
+                }
+            } finally {
+                runOnUiThread { pendingBusy = false }
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -214,12 +256,15 @@ class MainActivity : ComponentActivity() {
                             lastRefreshMs = System.currentTimeMillis()
                         }.onFailure { if ((it as? PhoenixApi.Refused)?.status == 401) signIn = true }
                     }
+                    // Every time Phoenix answers, the anchor is renewed once it is five minutes old.
+                    if (!signIn) FieldStore.pack(this)?.let { pack -> runCatching { PhoenixApi.refreshAnchorIfOld(this, pack.seatId) } }
                     if (!signIn && FieldStore.waiting(this)) {
                         runOnUiThread { sending = true; if (screen == Screen.HOME) showHome() }
                         if (FieldStore.drain(this) == FieldStore.Outcome.SIGN_IN) signIn = true
                     }
                 }
             }
+            Notifier.refresh(this)
             runOnUiThread {
                 val changed = online != answers || needsSignIn != signIn || sending
                 online = answers
@@ -242,7 +287,7 @@ class MainActivity : ComponentActivity() {
                 "Camera and precise location",
                 "The Phoenix Camera needs the camera and your precise location to seal a photo.",
                 "Allow both",
-            ) { permissions.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION)) }
+            ) { permissions.launch(asked()) }
             PhoneChecks.rooted(this) || PhoneChecks.emulator() -> showMessage(
                 "This phone cannot seal photos",
                 "Its system has been modified. Use a phone with its original system.",
@@ -280,11 +325,11 @@ class MainActivity : ComponentActivity() {
             val secret = password.text.toString()
             val previous = PhoenixApi.hrId(this)
             when {
-                !Regex("^[A-Z0-9-]{2,20}$").matches(id) || secret.isEmpty() -> {
+                !Regex("^[A-Z0-9-]{2,35}$").matches(id) || secret.isEmpty() -> {
                     problem.text = "Enter your HR ID and your Phoenix password."
                     problem.visibility = View.VISIBLE
                 }
-                previous.isNotEmpty() && previous != id && FieldStore.waiting(this) -> {
+                previous.isNotEmpty() && previous != id && Notifier.anythingWaiting(this) -> {
                     problem.text = "Visits taken under $previous are waiting to send. Sign in as $previous first."
                     problem.visibility = View.VISIBLE
                 }
@@ -349,7 +394,7 @@ class MainActivity : ComponentActivity() {
         draft = null
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val rows = mutableListOf<View>()
-        val waiting = FieldStore.waiting(this)
+        val waiting = Notifier.anythingWaiting(this)
         val refused = FieldStore.queued(this).filter { it.has("refused") }
 
         if (online == true) {
@@ -389,9 +434,9 @@ class MainActivity : ComponentActivity() {
             if (waiting) {
                 rows += gap(16)
                 rows += card(
-                    micro("Waiting to send"),
+                    micro("Visits waiting to be sent"),
                     gap(6),
-                    body("Some visits are on the phone. They send themselves to Phoenix when there is network."),
+                    body("They are saved on the phone and send themselves to Phoenix when there is network, even with the app closed."),
                     gap(12),
                     wave = true,
                 )
@@ -400,7 +445,7 @@ class MainActivity : ComponentActivity() {
         for (item in refused) {
             rows += gap(14)
             rows += card(
-                micro("Not recorded"),
+                micro("Visit"),
                 gap(6),
                 TextView(this).apply {
                     text = item.optString("customerName")
@@ -561,8 +606,9 @@ class MainActivity : ComponentActivity() {
                     body.put("companions", JSONArray(people.map { JSONObject().put("hrId", it.hrId).put("side", it.side) }))
                 }
             }
-            draft = VisitDraft(customer, planned, body)
-            showCamera()
+            val visit = VisitDraft(customer, planned, body)
+            draft = visit
+            if (customer.validated) showCamera() else showPhotoKind(visit)
         }
 
         val rows = mutableListOf<View>(
@@ -593,6 +639,41 @@ class MainActivity : ComponentActivity() {
         rows += gap(10)
         rows += outlineButton("Back") { showList(planned) }
         setScreen(page(*rows.toTypedArray()))
+    }
+
+    /**
+     * A customer with no place yet (camera 2.1, owner 20 Nov 2026): the rep says what the photo shows. A polyclinic
+     * often has no timetable, so the doctor's name in one of four places stands in for it. Phoenix reads it and the
+     * System Administrator decides.
+     */
+    private fun showPhotoKind(visit: VisitDraft) {
+        stopCamera()
+        screen = Screen.KIND
+        val kinds = listOf(
+            "place" to "Clinic sign or door",
+            "door_sign" to "Doctor's name on his room door",
+            "banner" to "Building sign or banner with the doctor's name",
+            "prescription" to "Polyclinic printed prescription with the doctor's and polyclinic's names",
+            "business_card" to "Doctor's business card, inside the polyclinic",
+        )
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun render() {
+            column.removeAllViews()
+            for ((kind, words) in kinds) {
+                column.addView(toggleRow(words, visit.photoKind == kind) { visit.photoKind = kind; render() })
+            }
+        }
+        render()
+        setScreen(page(
+            heading("The photo", "What will the photo show?"),
+            body("${visit.customer.name} has no place in Phoenix yet. Choose what you will photograph."),
+            gap(16),
+            column,
+            gap(16),
+            primaryButton("Open the camera") { showCamera() },
+            gap(10),
+            outlineButton("Back") { showForm(visit.customer, visit.planned) },
+        ))
     }
 
     /** A full-width row with a square check, flat: orange when chosen. */
@@ -673,7 +754,11 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(navy)
             setPadding(dp(20), dp(10), dp(20), dp(18))
-            addView(sideButton("Back", Gravity.START) { if (!busy) showForm(visit.customer, visit.planned) })
+            addView(sideButton("Back", Gravity.START) {
+                if (!busy) {
+                    if (visit.customer.validated) showForm(visit.customer, visit.planned) else showPhotoKind(visit)
+                }
+            })
             addView(take)
             addView(sideButton("", Gravity.END) {})
         }
@@ -708,13 +793,17 @@ class MainActivity : ComponentActivity() {
         refreshStatus()
     }
 
-    private fun showSaved(customer: PackCustomer) {
+    private fun showSaved(customer: PackCustomer, locationPending: Boolean) {
         stopCamera()
         screen = Screen.OTHER
         draft = null
         setScreen(page(
-            heading("Saved", "The visit is saved"),
-            body("${customer.name}: the visit and its photo are on the phone. They send themselves to Phoenix when there is network; you do not need to send anything."),
+            heading("Saved", if (locationPending) "Location pending" else "The visit is saved"),
+            body(if (locationPending) {
+                "${customer.name}: the visit and its photo are on the phone. The location is added by itself; keeping the app open for a moment helps. They send themselves to Phoenix when there is network."
+            } else {
+                "${customer.name}: the visit and its photo are on the phone. They send themselves to Phoenix when there is network; you do not need to send anything."
+            }),
             gap(20),
             primaryButton("Next visit") { showHome() },
         ))
@@ -781,7 +870,7 @@ class MainActivity : ComponentActivity() {
 
     /** The reading a photo taken now would be sealed with at once, or null while the location is still settling. */
     private fun lockedNow(current: PositionWatch): PositionWatch.Fix? =
-        current.best(SystemClock.elapsedRealtimeNanos(), INSTANT_AGE_MS, 0L)?.takeIf { it.location.accuracy <= EXACT_M }
+        current.best(SystemClock.elapsedRealtimeNanos(), INSTANT_AGE_MS, 0L)?.takeIf { it.location.accuracy <= Pending.EXACT_M }
 
     private fun refreshStatus() {
         val current = watch ?: return
@@ -801,7 +890,7 @@ class MainActivity : ComponentActivity() {
             statusView?.text = problem ?: if (locked != null) {
                 "Take the photo."
             } else {
-                "Take the photo now. The location locks by itself in a few seconds."
+                "Take the photo now. The location is added by itself."
             }
         }
         shutter?.isEnabled = problem == null && !busy
@@ -816,17 +905,33 @@ class MainActivity : ComponentActivity() {
             toast("A fake-location app is switched on in this phone. Switch it off to take the photo.")
             return
         }
-        val shot = Shot(SystemClock.elapsedRealtimeNanos(), System.currentTimeMillis(), current.satellites.used, current.satellites.seen)
+        val shutterNanos = SystemClock.elapsedRealtimeNanos()
+        val shot = Shot(
+            shutterNanos = shutterNanos,
+            phoneMs = System.currentTimeMillis(),
+            satellitesUsed = current.satellites.used,
+            satellitesSeen = current.satellites.seen,
+            satelliteMs = SatelliteClock.utcAt(this, shutterNanos),
+            networkMs = PhoenixClock.nowMs(this),
+            offline = PhoenixApi.offlineClock(this, shutterNanos / 1_000_000),
+            bootId = PhoenixApi.bootId(this),
+        )
         busy = true
         refreshStatus()
-        statusView?.text = "Photo taken. Locking the location…"
+        statusView?.text = "Saving the visit…"
         use.takePicture(worker, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
-                val photo = runCatching { Sealer.upright(image.toBitmap(), image.imageInfo.rotationDegrees) }
-                image.close()
+                val saved = runCatching {
+                    val photo = try {
+                        Sealer.upright(image.toBitmap(), image.imageInfo.rotationDegrees)
+                    } finally {
+                        image.close()
+                    }
+                    keep(photo, shot, visit)
+                }
                 runOnUiThread {
-                    photo.onSuccess { lockThenSeal(it, shot, visit) }.onFailure {
-                        busy = false
+                    busy = false
+                    saved.onSuccess { pending -> showSaved(visit.customer, pending) }.onFailure {
                         toast("The camera did not take the photo. Try again.")
                         refreshStatus()
                     }
@@ -844,81 +949,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The photo is in hand. It is sealed with the most accurate reading around its shutter the moment one is exact
-     * ([EXACT_M]); after [LOCK_WAIT_MS] the best reading within [MAX_M] is taken; with none the rep is told where to
-     * stand and the photo is not kept.
+     * Runs on the worker thread the moment the photo is in hand. The stamp (date and time, whom and who) is burned in
+     * and the photo is stored with the shutter's facts as a pending visit, so nothing is lost; it is then sealed at
+     * once if a good reading from the ten minutes before the shutter is held. Returns true while the visit still
+     * waits for its place.
      */
-    private fun lockThenSeal(photo: Bitmap, shot: Shot, visit: VisitDraft) {
-        val poll = object : Runnable {
-            override fun run() {
-                val current = watch
-                if (current == null) {
-                    busy = false
-                    refreshStatus()
-                    return
-                }
-                if (current.mockSeen()) {
-                    busy = false
-                    toast("A fake-location app is giving the position. Switch it off to take the photo.")
-                    refreshStatus()
-                    return
-                }
-                val sinceMs = (SystemClock.elapsedRealtimeNanos() - shot.shutterNanos) / 1_000_000
-                val exact = current.best(shot.shutterNanos, INSTANT_AGE_MS, LOCK_WAIT_MS)?.takeIf { it.location.accuracy <= EXACT_M }
-                val best = current.best(shot.shutterNanos, BEFORE_MS, LOCK_WAIT_MS)
-                val chosen = exact ?: if (sinceMs >= LOCK_WAIT_MS) best?.takeIf { it.location.accuracy <= MAX_M } else null
-                when {
-                    chosen != null -> sealInBackground(photo, chosen, shot, visit)
-                    sinceMs >= LOCK_WAIT_MS -> {
-                        busy = false
-                        showMessage(
-                            "The location did not lock here",
-                            "Step near a window or the door for a moment, then take the photo again.",
-                            "Back to the camera",
-                        ) { showCamera() }
-                    }
-                    else -> ticker.postDelayed(this, 250L)
-                }
-            }
-        }
-        ticker.post(poll)
-    }
-
-    private fun sealInBackground(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot, visit: VisitDraft) {
-        statusView?.text = "Saving the visit…"
-        worker.execute {
-            val result = runCatching {
-                val file = seal(photo, fix, shot, visit)
-                FieldStore.enqueue(this, visit.visitId, file.name, visit.body, visit.customer.name)
-            }
-            runOnUiThread {
-                busy = false
-                result.onSuccess { showSaved(visit.customer) }.onFailure {
-                    toast("The visit could not be saved: ${it.message ?: "try again"}")
-                    refreshStatus()
-                }
-            }
-        }
-    }
-
-    private fun seal(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot, visit: VisitDraft): File {
-        SealKey.ensure()
+    private fun keep(photo: Bitmap, shot: Shot, visit: VisitDraft): Boolean {
         val pack = FieldStore.pack(this) ?: throw IllegalStateException("sign in again")
-        val sinceShutterMs = (SystemClock.elapsedRealtimeNanos() - shot.shutterNanos) / 1_000_000
-        // Positive: the reading was taken before the shutter; negative: just after it, while the location locked.
-        val fixAgeMs = -fix.offsetMs(shot.shutterNanos)
-        val satelliteMs = SatelliteClock.utcAt(this, shot.shutterNanos)
-        val networkMs = PhoenixClock.nowMs(this)?.minus(sinceShutterMs)
         val takenMs: Long
         val timeSource: String
         val timeWords: String
         when {
-            satelliteMs != null -> { takenMs = satelliteMs; timeSource = "satellites"; timeWords = "satellite time" }
-            networkMs != null -> { takenMs = networkMs; timeSource = "phoenix"; timeWords = "Phoenix time" }
+            shot.satelliteMs != null -> { takenMs = shot.satelliteMs; timeSource = "satellites"; timeWords = "satellite time" }
+            shot.networkMs != null -> { takenMs = shot.networkMs; timeSource = "phoenix"; timeWords = "Phoenix time" }
             else -> { takenMs = shot.phoneMs; timeSource = "phone"; timeWords = "phone's clock" }
         }
         val takenAt = Instant.ofEpochMilli(takenMs)
-        val used = if (fix.source == "gps") fix.satellites else shot.satellitesUsed
 
         // The stamp names when, whom and who; the place and its accuracy travel in the seal, read above the rep.
         val stamped = Sealer.stamp(photo, listOf(
@@ -929,48 +975,37 @@ class MainActivity : ComponentActivity() {
         ))
         val jpeg = Sealer.encode(stamped)
 
-        val visitBlock = JSONObject()
+        val meta = JSONObject()
+            .put("visitId", visit.visitId)
+            .put("shutterNanos", shot.shutterNanos)
+            .put("bootId", shot.bootId)
             .put("seatId", pack.seatId)
             .put("customerId", visit.customer.customerId)
-            .put("visitId", visit.visitId)
-            .put("offline", PhoenixApi.offlineClock(this, shot.shutterNanos / 1_000_000) ?: JSONObject.NULL)
-
-        val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
-        val payload = JSONObject()
-            .put("v", 1)
-            .put("app", packageName)
-            .put("appVersion", appVersion())
-            .put("imageSha256", Sealer.sha256Hex(jpeg))
+            .put("customerName", visit.customer.name)
+            .put("photoKind", visit.photoKind)
+            .put("draft", visit.body)
             .put("hrId", repHrId())
             .put("repName", repName())
-            .put("lat", fix.location.latitude)
-            .put("lon", fix.location.longitude)
-            .put("accuracyMeters", fix.location.accuracy.toDouble())
-            .put("satellitesUsed", used)
+            .put("satellitesUsed", shot.satellitesUsed)
             .put("satellitesSeen", shot.satellitesSeen)
-            .put("provider", fix.source)
-            .put("fixAgeMs", fixAgeMs)
             .put("takenAtUtc", takenAt.toString())
             .put("timeSource", timeSource)
             .put("phoneClockUtc", Instant.ofEpochMilli(shot.phoneMs).toString())
-            .put("networkTimeUtc", networkMs?.let { Instant.ofEpochMilli(it).toString() } ?: JSONObject.NULL)
-            .put("mock", fix.mock)
-            .put("mockAppActive", PhoneChecks.mockAppActive(this))
-            .put("rooted", PhoneChecks.rooted(this))
-            .put("emulator", PhoneChecks.emulator())
-            .put("developerOptions", PhoneChecks.developerOptions(this))
-            .put("adb", PhoneChecks.adb(this))
-            .put("deviceModel", "${Build.MANUFACTURER} ${Build.MODEL}".take(120))
-            .put("androidSdk", Build.VERSION.SDK_INT)
-            .put("nonce", nonce)
-            .put("visit", visitBlock)
-            .toString()
-
-        val signature = SealKey.sign(payload.toByteArray(Charsets.UTF_8))
-        val bytes = Sealer.assemble(jpeg, payload, signature, SealKey.chain())
-        val file = FieldStore.sealedFile(this, "Phoenix-Camera-${takenAt.atZone(cairo).format(fileTime)}-${visit.visitId.take(8)}.jpg")
-        file.writeBytes(bytes)
-        return file
+            .put("networkTimeUtc", shot.networkMs?.let { Instant.ofEpochMilli(it).toString() } ?: JSONObject.NULL)
+            .put("offline", shot.offline ?: JSONObject.NULL)
+            .put(
+                "checks",
+                JSONObject()
+                    .put("mockAppActive", PhoneChecks.mockAppActive(this))
+                    .put("rooted", PhoneChecks.rooted(this))
+                    .put("developerOptions", PhoneChecks.developerOptions(this))
+                    .put("adb", PhoneChecks.adb(this)),
+            )
+        Pending.save(this, visit.visitId, jpeg, meta)
+        Pending.advance(this, watch)
+        SendWork.kick(this)
+        Notifier.refresh(this)
+        return Pending.isPending(this, visit.visitId)
     }
 
     // ── Small helpers ────────────────────────────────────────────────────────────────────────────────────────
@@ -984,18 +1019,25 @@ class MainActivity : ComponentActivity() {
         runCatching { ProcessCameraProvider.getInstance(this).get().unbindAll() }
     }
 
-    /** Phoenix refuses a seal older than 72 hours, so the phone does not keep one. */
-    private fun dropExpiredPhotos() {
+    /**
+     * A sealed photo stays until Phoenix has it, however old (2.1: Phoenix receives every visit and the System
+     * Administrator decides). Only a photo no waiting visit names any more, left by an interrupted save, is removed
+     * after three days.
+     */
+    private fun dropOrphanPhotos() {
+        val named = FieldStore.queued(this).map { it.optString("file") }.toSet()
         val cutoff = System.currentTimeMillis() - 72L * 3_600_000L
-        (File(filesDir, "sealed").listFiles()?.toList() ?: emptyList()).filter { it.lastModified() < cutoff }.forEach { it.delete() }
+        (File(filesDir, "sealed").listFiles()?.toList() ?: emptyList())
+            .filter { it.name !in named && it.lastModified() < cutoff }
+            .forEach { it.delete() }
     }
 
-    private fun repHrId(): String = PhoenixApi.hrId(this)
+    /**
+     * The HR ID a seal carries: the one Phoenix's own pack names, never the typed login id. A test account (TEST-…)
+     * mirrors a real rep and Phoenix checks the seal against that rep. No seal is made before a pack has loaded.
+     */
+    private fun repHrId(): String = FieldStore.pack(this)?.hrId?.takeIf { it.isNotBlank() } ?: PhoenixApi.hrId(this)
     private fun repName(): String = FieldStore.pack(this)?.repName ?: ""
-
-    private fun appVersion(): String = runCatching {
-        packageManager.getPackageInfo(packageName, 0).versionName
-    }.getOrNull() ?: "2.0.0"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 

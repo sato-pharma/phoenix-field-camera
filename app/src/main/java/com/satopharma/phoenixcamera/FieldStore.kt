@@ -15,6 +15,8 @@ class PackCustomer(
     val plannedToday: Boolean,
     val visitedToday: Boolean,
     val lastProducts: List<String>,
+    /** Phoenix already holds his place; when false the photo may also be the doctor's name (camera 2.1). */
+    val validated: Boolean,
 )
 
 /** Somebody the rep may name on "Who was on the visit". */
@@ -56,6 +58,7 @@ class Pack(
                         plannedToday = c.optBoolean("plannedToday"),
                         visitedToday = c.optBoolean("visitedToday"),
                         lastProducts = strings(c.optJSONArray("lastProducts")),
+                        validated = c.optBoolean("validated", true),
                     )
                 },
             )
@@ -122,14 +125,20 @@ object FieldStore {
         queued(context).firstOrNull { it.optString("visitId") == visitId }?.let { finish(context, it) }
     }
 
+    /** The only words the rep reads about a visit Phoenix did not take in the ordinary way. */
+    const val SENT_FOR_REVIEW = "This visit went to the System Administrator."
+
     /** What happened to one send. */
     enum class Outcome { RECORDED, REFUSED, LATER, SIGN_IN }
 
     /**
-     * Sends every waiting visit, oldest first. Recorded or a resend of one already recorded: it leaves the queue.
-     * Refused in words: it stays, marked, so the rep reads why and records it in the main account. No answer: it
-     * waits for the next time. A lapsed login stops the run until the rep signs in again.
+     * Sends every waiting visit, oldest first. Phoenix answers every visit it received with success (2.1: it refuses
+     * nothing from the camera and the System Administrator decides), and the visit leaves the queue. Any other
+     * refusal: it stays, marked, with plain words and never Phoenix's own. No answer: it waits for the next time. A
+     * lapsed login stops the run until the rep signs in again. One run at a time: the app and the background send
+     * never send the same visit together.
      */
+    @Synchronized
     fun drain(context: Context): Outcome? {
         var last: Outcome? = null
         for (item in queued(context)) {
@@ -164,7 +173,7 @@ object FieldStore {
             reply.status == 401 -> Outcome.SIGN_IN
             reply.status == 429 || reply.status >= 500 -> Outcome.LATER
             else -> {
-                markRefused(context, item, PhoenixApi.wordsOf(reply, "Phoenix could not record this visit. Record it in the main account."))
+                markRefused(context, item, SENT_FOR_REVIEW)
                 Outcome.REFUSED
             }
         }

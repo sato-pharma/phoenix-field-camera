@@ -15,8 +15,8 @@ android {
         applicationId = "com.satopharma.phoenixcamera"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.0.0"
+        versionCode = 6
+        versionName = "2.1.0"
     }
 
     signingConfigs {
@@ -59,4 +59,6 @@ dependencies {
     implementation("com.google.android.gms:play-services-location:21.3.0")
     // play-services-location brings Fragment 1.0, too old for the permission request (lint InvalidFragmentVersionForActivityResult).
     implementation("androidx.fragment:fragment-ktx:1.8.5")
+    // Android's own scheduler: the waiting visits send with the app closed or after a restart (2.1).
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }

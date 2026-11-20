@@ -22,7 +22,7 @@ import kotlin.math.abs
  * Where the rep is, from the moment the app opens (owner, 20 Nov 2026: "I don't want him to wait for the satellites
  * ... when he opens the app he can capture the location and take the photo now").
  *
- * Two sources run side by side and every reading is kept for a few minutes:
+ * Two sources run side by side and every reading is kept for eleven minutes:
  *   - the phone's combined position (Google's fused location: Wi-Fi, the mobile network and the satellites together),
  *     the only one that answers inside a polyclinic, usually within a second or two;
  *   - the satellites alone (GPS), which also give the satellites' own clock and count.
@@ -134,12 +134,15 @@ class PositionWatch(private val context: Context, private val onChange: () -> Un
         .filter { val offset = it.offsetMs(shutterNanos); offset >= -beforeMs && offset <= afterMs }
         .minWithOrNull(compareBy<Fix>({ it.location.accuracy }, { abs(it.offsetMs(shutterNanos)) }))
 
+    /** Every genuine reading still kept (no fake-location mark), oldest first. */
+    fun genuine(): List<Fix> = snapshot().filter { !it.mock }
+
     /** Milliseconds since the newest reading, or null with none yet. */
     fun latestAgeMs(): Long? = latest()?.let { (SystemClock.elapsedRealtimeNanos() - it.location.elapsedRealtimeNanos) / 1_000_000 }
 
     companion object {
-        /** Readings are kept this long, so a photo can use one taken just before its shutter. */
-        const val KEEP_MS = 5 * 60_000L
+        /** Readings are kept this long: a photo may carry one from up to ten minutes before its shutter (2.1). */
+        const val KEEP_MS = 11 * 60_000L
 
         /**
          * Android's accuracy is the radius the phone is 68% sure of. For the owner's "at least 98% accurate" the
