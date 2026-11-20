@@ -2,11 +2,9 @@ package com.satopharma.phoenixcamera
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -23,6 +21,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
+import android.text.method.PasswordTransformationMethod
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -46,11 +45,11 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.content.res.ResourcesCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.widget.doAfterTextChanged
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.SecureRandom
@@ -58,21 +57,22 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.roundToInt
 
 /**
- * The Phoenix Camera: a live camera only (no gallery), the rep's position and time, and a seal Phoenix can check.
- * The rep sends the file to the System Administrator as a WhatsApp DOCUMENT, so it arrives whole; Phoenix accepts it
- * for 72 hours after it was taken.
+ * The Phoenix Camera 2.0: the rep's own visit app for a clinic with no network (owner, 20 Nov 2026).
  *
- * The rep never waits for the location (owner, 20 Nov 2026: "I don't want him to wait for the satellites ... he can
- * take the photo now, and make sure the location is accurate, at least 98%"). The location starts when the app opens
- * ([PositionWatch]: the phone's combined Wi-Fi, mobile-network and satellite position beside the satellites alone),
- * the shutter is always live, and the photo is sealed with the most accurate reading around its shutter as soon as
- * the phone is 98% sure of the place to within [EXACT_M] x 1.85 m, at worst [MAX_M] x 1.85 m. A fake-location mark
- * on any reading, a fake-location app switched on, a rooted phone or an emulator still stop the photo.
+ * He signs in with his HR ID and Phoenix password once, with network; the phone then keeps his list, today's plan and
+ * the line's products. With no network he chooses Planned or Unplanned, picks the customer, fills the same visit the
+ * main account asks for, and takes a live photo. The photo is sealed with the place and time and the visit it was
+ * taken for, and waits on the phone. The moment Phoenix answers again the visit sends itself: the validation and the
+ * visit register in Phoenix, and nobody sends anything by hand. While Phoenix answers, the camera refuses a visit:
+ * "you have network, go validate in the main account".
+ *
+ * The rep never waits for the location, and no reading is shown to him: no satellites, no accuracy, no distance. The
+ * seal carries all of it to Phoenix, where it is read above him only.
  *
  * Dressed in the Phoenix identity: the signature card's navy, orange and cream, square corners, flat colour.
  */
@@ -89,25 +89,41 @@ class MainActivity : ComponentActivity() {
         const val LOCK_WAIT_MS = 20_000L
         /** The oldest reading a photo may carry. Phoenix allows two minutes. */
         const val BEFORE_MS = 120_000L
+        /** How often the phone asks whether Phoenix answers. */
+        const val NETWORK_EVERY_MS = 15_000L
+        /** With network, the list and the time anchor are read again at most this often. */
+        const val REFRESH_EVERY_MS = 10L * 60_000L
     }
 
     /** What the phone knew at the instant of the shutter. */
     private class Shot(val shutterNanos: Long, val phoneMs: Long, val satellitesUsed: Int, val satellitesSeen: Int)
 
+    /** The visit a photo is being taken for. */
+    private class VisitDraft(val customer: PackCustomer, val planned: Boolean, val body: JSONObject) {
+        val visitId: String = UUID.randomUUID().toString()
+    }
+
+    private enum class Screen { START, LOGIN, HOME, LIST, FORM, CAMERA, OTHER }
+
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+    private val net: ExecutorService = Executors.newSingleThreadExecutor()
     private var watch: PositionWatch? = null
     private var imageCapture: ImageCapture? = null
     private var statusView: TextView? = null
     private var stateView: TextView? = null
     private var stateDot: View? = null
-    private var satValue: TextView? = null
-    private var accValue: TextView? = null
-    private var timeLabel: TextView? = null
-    private var timeValue: TextView? = null
     private var shutter: View? = null
     private var busy = false
+    private var screen = Screen.START
+    private var draft: VisitDraft? = null
+
+    /** Null until the first answer; true while Phoenix answers. */
+    private var online: Boolean? = null
+    private var needsSignIn = false
+    private var lastRefreshMs = 0L
+    private var sending = false
+
     private val ticker = Handler(Looper.getMainLooper())
-    // The camera screen counts every second even when the satellites send nothing, so "nothing in view" shows as such.
     private val tick = object : Runnable {
         override fun run() {
             if (statusView == null) return
@@ -115,11 +131,15 @@ class MainActivity : ComponentActivity() {
             ticker.postDelayed(this, 1_000L)
         }
     }
+    private val networkLoop = object : Runnable {
+        override fun run() {
+            checkNetwork()
+            ticker.postDelayed(this, NETWORK_EVERY_MS)
+        }
+    }
 
     private val cairo = ZoneId.of("Africa/Cairo")
     private val stampTime = DateTimeFormatter.ofPattern("d MMM yyyy · HH:mm:ss", Locale.ENGLISH)
-    private val listDay = DateTimeFormatter.ofPattern("EEEE d MMMM", Locale.ENGLISH)
-    private val listTime = DateTimeFormatter.ofPattern("HH:mm", Locale.ENGLISH)
     private val fileTime = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.ENGLISH)
 
     // ── The Phoenix identity ─────────────────────────────────────────────────────────────────────────────────
@@ -157,27 +177,65 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        worker.execute { PhoenixClock.refresh(this) }
         startWatch()
+        ticker.removeCallbacks(networkLoop)
+        ticker.post(networkLoop)
     }
 
     override fun onPause() {
         watch?.stop()
+        ticker.removeCallbacks(networkLoop)
         super.onPause()
     }
 
     override fun onDestroy() {
         watch?.stop()
         worker.shutdown()
+        net.shutdown()
         super.onDestroy()
+    }
+
+    // ── The network: refuse while Phoenix answers, and send everything waiting the moment it does ────────────
+
+    private fun checkNetwork() {
+        net.execute {
+            val answers = PhoenixApi.reachable()
+            var signIn = false
+            if (answers) {
+                PhoenixClock.refresh(this)
+                if (PhoenixApi.signedInOnce(this) && PhoenixApi.token(this) == null) {
+                    signIn = true
+                } else if (PhoenixApi.token(this) != null) {
+                    if (System.currentTimeMillis() - lastRefreshMs > REFRESH_EVERY_MS || FieldStore.pack(this) == null) {
+                        runCatching {
+                            val pack = PhoenixApi.pack(this)
+                            FieldStore.savePack(this, pack)
+                            PhoenixApi.refreshAnchor(this, pack.getString("seatId"))
+                            lastRefreshMs = System.currentTimeMillis()
+                        }.onFailure { if ((it as? PhoenixApi.Refused)?.status == 401) signIn = true }
+                    }
+                    if (!signIn && FieldStore.waiting(this)) {
+                        runOnUiThread { sending = true; if (screen == Screen.HOME) showHome() }
+                        if (FieldStore.drain(this) == FieldStore.Outcome.SIGN_IN) signIn = true
+                    }
+                }
+            }
+            runOnUiThread {
+                val changed = online != answers || needsSignIn != signIn || sending
+                online = answers
+                needsSignIn = signIn
+                sending = false
+                if (screen == Screen.HOME && changed) showHome()
+                if (screen == Screen.CAMERA) refreshStatus()
+            }
+        }
     }
 
     // ── Screens ──────────────────────────────────────────────────────────────────────────────────────────────
 
     private fun showStart() {
-        val granted = listOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION).all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
+        screen = Screen.START
+        val granted = permitted()
         if (granted) startWatch()
         when {
             !granted -> showMessage(
@@ -191,8 +249,8 @@ class MainActivity : ComponentActivity() {
                 null,
                 null,
             )
-            repHrId().isEmpty() -> showSetup()
-            else -> showCamera()
+            !PhoenixApi.signedInOnce(this) || FieldStore.pack(this) == null -> showLogin(null)
+            else -> showHome()
         }
     }
 
@@ -207,57 +265,362 @@ class MainActivity : ComponentActivity() {
         })
     }
 
-    private fun showSetup() {
+    private fun showLogin(note: String?) {
         stopCamera()
-        val preview = TextView(this).apply {
-            typeface = script
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 36f)
-            setTextColor(ink)
-            setPadding(0, dp(4), 0, dp(2))
+        screen = Screen.LOGIN
+        val hrId = field("For example B-182", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, PhoenixApi.hrId(this))
+        val password = field("Your Phoenix password", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD, "").apply {
+            // After the single-line dressing, which would otherwise show the password.
+            transformationMethod = PasswordTransformationMethod.getInstance()
         }
-        fun showName(value: String) {
-            preview.text = value.ifBlank { "Your name" }
-            preview.setTextColor(if (value.isBlank()) rule else ink)
+        val problem = body("").apply { setTextColor(orangePressed); visibility = View.GONE }
+        lateinit var signIn: TextView
+        signIn = primaryButton("Sign in") {
+            val id = hrId.text.toString().trim().uppercase(Locale.ENGLISH)
+            val secret = password.text.toString()
+            val previous = PhoenixApi.hrId(this)
+            when {
+                !Regex("^[A-Z0-9-]{2,20}$").matches(id) || secret.isEmpty() -> {
+                    problem.text = "Enter your HR ID and your Phoenix password."
+                    problem.visibility = View.VISIBLE
+                }
+                previous.isNotEmpty() && previous != id && FieldStore.waiting(this) -> {
+                    problem.text = "Visits taken under $previous are waiting to send. Sign in as $previous first."
+                    problem.visibility = View.VISIBLE
+                }
+                else -> {
+                    signIn.isEnabled = false
+                    problem.visibility = View.GONE
+                    net.execute {
+                        val result = runCatching {
+                            if (previous.isNotEmpty() && previous != id) FieldStore.clear(this)
+                            PhoenixApi.signIn(this, id, secret)
+                            val pack = PhoenixApi.pack(this)
+                            FieldStore.savePack(this, pack)
+                            PhoenixApi.refreshAnchor(this, pack.getString("seatId"))
+                            lastRefreshMs = System.currentTimeMillis()
+                        }
+                        runOnUiThread {
+                            signIn.isEnabled = true
+                            result.onSuccess {
+                                online = true
+                                needsSignIn = false
+                                showHome()
+                            }.onFailure { error ->
+                                problem.text = when {
+                                    error is PhoenixApi.Refused && error.status == 404 ->
+                                        "This camera is for a medical rep's own territory. Your login has no territory of its own."
+                                    error is PhoenixApi.Refused -> error.message ?: "Phoenix did not sign you in."
+                                    else -> "Signing in needs network. Try again where there is network."
+                                }
+                                problem.visibility = View.VISIBLE
+                            }
+                        }
+                    }
+                }
+            }
         }
-        val hrId = field("For example B-182", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, repHrId())
-        val name = field("As it is on your Phoenix account", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS, repName())
-        showName(repName())
-        name.doAfterTextChanged { showName(it?.toString()?.trim() ?: "") }
-
         val card = card(
-            micro("Rep identity"),
-            preview,
-            divider("Phoenix Camera"),
+            micro("Sign in"),
             gap(12),
-            micro("HR id", soft = true),
+            micro("HR ID", soft = true),
             hrId,
             gap(14),
-            micro("Full name", soft = true),
-            name,
+            micro("Password", soft = true),
+            password,
             gap(20),
             wave = true,
         )
-        val save = primaryButton("Save and open the camera") {
-            val id = hrId.text.toString().trim().uppercase(Locale.ENGLISH)
-            val full = name.text.toString().trim()
-            if (!Regex("^[A-Z0-9-]{2,20}$").matches(id) || full.length < 3) {
-                toast("Enter your own HR id and your full name.")
-            } else {
-                prefs().edit().putString("hrId", id).putString("name", full.take(120)).apply()
-                showCamera()
-            }
-        }
         setScreen(page(
-            heading("Rep identity", "Who is taking the photos"),
-            body("Every photo you take carries your name and HR id. Enter your own, exactly as on your Phoenix account."),
+            heading("Phoenix account", "Sign in with your HR ID"),
+            body(note ?: "Use the same HR ID and password as your Phoenix account. Sign in where there is network; your list stays on the phone for the places with none."),
             gap(16),
             card,
-            gap(20),
-            save,
+            gap(12),
+            problem,
+            gap(12),
+            signIn,
         ))
     }
 
+    private fun showHome() {
+        stopCamera()
+        screen = Screen.HOME
+        draft = null
+        val pack = FieldStore.pack(this) ?: return showLogin(null)
+        val rows = mutableListOf<View>()
+        val waiting = FieldStore.waiting(this)
+        val refused = FieldStore.queued(this).filter { it.has("refused") }
+
+        if (online == true) {
+            rows += heading("You have network", "Use the main account")
+            rows += body("You have network, so record and validate this visit in the main Phoenix account. The camera is for the places with no network.")
+            rows += gap(16)
+            rows += card(
+                micro(if (needsSignIn) "Sign in again" else "Ready for no network"),
+                gap(6),
+                body(when {
+                    needsSignIn -> "Your login has ended. Sign in again so your list stays current and your visits can send."
+                    sending || waiting -> "Your visits are sending to Phoenix now."
+                    else -> "Your list and today's plan are on the phone. Every visit taken here has reached Phoenix."
+                }),
+                gap(12),
+                wave = true,
+            )
+            if (needsSignIn) {
+                rows += gap(16)
+                rows += primaryButton("Sign in again") { showLogin("Your login has ended. Sign in again so your visits can send.") }
+            }
+        } else {
+            rows += heading(pack.repName.ifBlank { "Today's visits" }, "Record a visit")
+            rows += body(if (online == null) "Checking for network…" else "No network here. Choose the visit, take the photo, and it sends itself when there is network.")
+            rows += gap(18)
+            rows += primaryButton("Planned visit") { showList(planned = true) }
+            rows += gap(10)
+            rows += outlineButton("Unplanned visit") { showList(planned = false) }
+            rows += gap(10)
+            rows += outlineButton("Add new customer") {
+                showMessage(
+                    "Add a new customer",
+                    "A new customer is added from the main account, with network: there you take his place and send him for approval.",
+                    "Back",
+                ) { showHome() }
+            }
+            if (waiting) {
+                rows += gap(16)
+                rows += card(
+                    micro("Waiting to send"),
+                    gap(6),
+                    body("Some visits are on the phone. They send themselves to Phoenix when there is network."),
+                    gap(12),
+                    wave = true,
+                )
+            }
+        }
+        for (item in refused) {
+            rows += gap(14)
+            rows += card(
+                micro("Not recorded"),
+                gap(6),
+                TextView(this).apply {
+                    text = item.optString("customerName")
+                    typeface = bold
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                    setTextColor(navy)
+                },
+                gap(4),
+                body(item.optString("refused")),
+                gap(10),
+                outlineButton("Remove from the phone") {
+                    FieldStore.forget(this, item.optString("visitId"))
+                    showHome()
+                },
+                gap(16),
+                wave = false,
+            )
+        }
+        if (online == true && !waiting && !needsSignIn) {
+            rows += gap(20)
+            rows += outlineButton("Sign out") {
+                PhoenixApi.signOut(this)
+                FieldStore.clear(this)
+                showLogin(null)
+            }
+        }
+        setScreen(page(*rows.toTypedArray()))
+    }
+
+    private fun showList(planned: Boolean) {
+        stopCamera()
+        screen = Screen.LIST
+        val pack = FieldStore.pack(this) ?: return showLogin(null)
+        val all = pack.customers.filter { it.plannedToday == planned }.sortedBy { it.name }
+        val listColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun render(query: String) {
+            listColumn.removeAllViews()
+            val shown = all.filter { query.isBlank() || it.name.contains(query, ignoreCase = true) || (it.speciality ?: "").contains(query, ignoreCase = true) }
+            if (shown.isEmpty()) {
+                listColumn.addView(body(if (all.isEmpty()) {
+                    if (planned) "No customer is planned for today on the list this phone holds." else "Every customer on your list is planned for today."
+                } else "No customer by that name."))
+            }
+            for (customer in shown) {
+                listColumn.addView(customerRow(customer) { showForm(customer, planned) })
+                listColumn.addView(gap(8))
+            }
+        }
+        val search = field("Search by name", InputType.TYPE_CLASS_TEXT, "")
+        search.doAfterTextChanged { render(it?.toString()?.trim() ?: "") }
+        render("")
+        val day = runCatching { java.time.LocalDate.parse(pack.visitDay).format(DateTimeFormatter.ofPattern("EEEE d MMMM", Locale.ENGLISH)) }.getOrNull()
+        setScreen(page(
+            heading(if (planned) "Planned visit" else "Unplanned visit", "Choose the customer"),
+            body(if (planned) "Your plan for ${day ?: "today"}." else "Customers on your list who are not on today's plan."),
+            gap(14),
+            search,
+            gap(14),
+            listColumn,
+            gap(14),
+            outlineButton("Back") { showHome() },
+        ))
+    }
+
+    private fun customerRow(customer: PackCustomer, onClick: () -> Unit): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), GradientDrawable().apply { setColor(rule); setStroke(dp(1), rule) })
+            addState(intArrayOf(), GradientDrawable().apply { setColor(paper); setStroke(dp(1), rule) })
+        }
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        isClickable = true
+        isFocusable = true
+        setOnClickListener { onClick() }
+        addView(TextView(this@MainActivity).apply {
+            text = customer.name
+            typeface = bold
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(navy)
+        })
+        val detail = listOfNotNull(customer.speciality, listWords(customer.listType), if (customer.visitedToday) "Visited today" else null).joinToString(" · ")
+        if (detail.isNotEmpty()) addView(micro(detail, soft = true).apply { setPadding(0, dp(6), 0, 0) })
+    }
+
+    private fun listWords(listType: String): String? = when (listType.lowercase(Locale.ENGLISH)) {
+        "am" -> "AM"
+        "pm" -> "PM"
+        "pharmacy" -> "Pharmacy"
+        else -> null
+    }
+
+    private fun showForm(customer: PackCustomer, planned: Boolean) {
+        stopCamera()
+        screen = Screen.FORM
+        val pack = FieldStore.pack(this) ?: return showLogin(null)
+        val chosenPeople = linkedSetOf<String>()
+        val chosenProducts = linkedSetOf<String>().apply { addAll(customer.lastProducts.filter { it in pack.products }) }
+
+        val peopleColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun renderPeople() {
+            peopleColumn.removeAllViews()
+            peopleColumn.addView(toggleRow("Alone", chosenPeople.isEmpty()) { chosenPeople.clear(); renderPeople() })
+            for (person in pack.people) {
+                peopleColumn.addView(toggleRow(person.name, person.hrId in chosenPeople) {
+                    if (!chosenPeople.remove(person.hrId)) chosenPeople.add(person.hrId)
+                    renderPeople()
+                })
+            }
+        }
+        renderPeople()
+
+        val productColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun renderProducts() {
+            productColumn.removeAllViews()
+            for (product in pack.products) {
+                productColumn.addView(toggleRow(product, product in chosenProducts) {
+                    if (!chosenProducts.remove(product)) chosenProducts.add(product)
+                    renderProducts()
+                })
+            }
+        }
+        renderProducts()
+
+        val comment = area("What was discussed")
+        val reason = if (planned) null else area("Why this visit was not on the plan (optional)")
+        val problem = body("").apply { setTextColor(orangePressed); visibility = View.GONE }
+
+        val take = primaryButton("Take the photo") {
+            val words = comment.text.toString().trim()
+            val people = pack.people.filter { it.hrId in chosenPeople }
+            val managers = people.filter { it.side == "manager" }
+            val message = when {
+                chosenProducts.isEmpty() -> "Choose the products you discussed."
+                words.isEmpty() -> "Write what was discussed."
+                people.size >= 2 && managers.isEmpty() -> "A visit with two or more people needs the district manager among them."
+                online == true -> "You have network. Record this visit in the main account."
+                else -> null
+            }
+            if (message != null) {
+                problem.text = message
+                problem.visibility = View.VISIBLE
+                return@primaryButton
+            }
+            val body = JSONObject()
+                .put("customerId", customer.customerId)
+                .put("products", JSONArray(chosenProducts.toList()))
+                .put("comment", words)
+                .put("visitType", if (planned) "planned" else "out_of_plan")
+            reason?.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { body.put("unplannedReason", it) }
+            when {
+                people.isEmpty() -> body.put("kind", "single")
+                people.size == 1 && people[0].side == "manager" -> body.put("kind", "double").put("managerHrId", people[0].hrId)
+                people.size == 1 -> body.put("kind", "product_manager").put("productManagerHrId", people[0].hrId)
+                else -> {
+                    body.put("kind", "chain").put("managerHrId", managers[0].hrId)
+                    people.firstOrNull { it.side == "product" }?.let { body.put("productManagerHrId", it.hrId) }
+                    managers.getOrNull(1)?.let { body.put("seniorHrId", it.hrId) }
+                    body.put("companions", JSONArray(people.map { JSONObject().put("hrId", it.hrId).put("side", it.side) }))
+                }
+            }
+            draft = VisitDraft(customer, planned, body)
+            showCamera()
+        }
+
+        val rows = mutableListOf<View>(
+            heading(if (planned) "Planned visit" else "Unplanned visit", customer.name),
+            gap(8),
+            micro("Who was on the visit"),
+            gap(8),
+            peopleColumn,
+            gap(18),
+            micro("Products discussed"),
+            gap(8),
+            productColumn,
+            gap(18),
+            micro("Comment"),
+            gap(6),
+            comment,
+        )
+        if (reason != null) {
+            rows += gap(16)
+            rows += micro("Reason", soft = true)
+            rows += gap(6)
+            rows += reason
+        }
+        rows += gap(14)
+        rows += problem
+        rows += gap(12)
+        rows += take
+        rows += gap(10)
+        rows += outlineButton("Back") { showList(planned) }
+        setScreen(page(*rows.toTypedArray()))
+    }
+
+    /** A full-width row with a square check, flat: orange when chosen. */
+    private fun toggleRow(label: String, chosen: Boolean, onToggle: () -> Unit): View = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        background = GradientDrawable().apply { setColor(if (chosen) cream else paper); setStroke(dp(1), if (chosen) orange else rule) }
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        isClickable = true
+        isFocusable = true
+        setOnClickListener { onToggle() }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(6) }
+        addView(View(this@MainActivity).apply {
+            background = GradientDrawable().apply { setColor(if (chosen) orange else paper); setStroke(dp(2), if (chosen) orange else inkSoft) }
+            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply { rightMargin = dp(12) }
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = label
+            typeface = if (chosen) bold else regular
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(navy)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+    }
+
     private fun showCamera() {
+        val visit = draft ?: return showHome()
+        screen = Screen.CAMERA
         val preview = PreviewView(this).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -271,7 +634,7 @@ class MainActivity : ComponentActivity() {
             })
         }
 
-        // The status band: one line of state, three readings, then what to do.
+        // The status band: the customer, one line of state, then what to do. No reading is shown.
         val dot = View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(10) } }
         val state = micro("", color = cream)
         val stateRow = LinearLayout(this).apply {
@@ -280,18 +643,12 @@ class MainActivity : ComponentActivity() {
             addView(dot)
             addView(state)
         }
-        val sat = reading()
-        val acc = reading()
-        val timeL = micro("Source", color = orange)
-        val timeV = reading()
-        val readings = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(12), 0, dp(12))
-            addView(cell(micro("Satellites", color = orange), sat))
-            addView(vRule())
-            addView(cell(micro("98% within", color = orange), acc))
-            addView(vRule())
-            addView(cell(timeL, timeV))
+        val who = TextView(this).apply {
+            text = visit.customer.name
+            typeface = bold
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(10), 0, dp(10))
         }
         val status = TextView(this).apply {
             typeface = regular
@@ -305,30 +662,25 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(navy)
             setPadding(dp(20), dp(14), dp(20), dp(4))
             addView(stateRow)
-            addView(readings)
+            addView(who)
             addView(hRule(navyRule))
             addView(status.apply { setPadding(0, dp(10), 0, 0) })
         }
 
         val take = Shutter().apply { setOnClickListener { capture() }; isEnabled = false }
-        val count = sealedFiles().size
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(navy)
             setPadding(dp(20), dp(10), dp(20), dp(18))
-            addView(sideButton(if (count > 0) "Photos · $count" else "Photos", Gravity.START) { showPhotos() })
+            addView(sideButton("Back", Gravity.START) { if (!busy) showForm(visit.customer, visit.planned) })
             addView(take)
-            addView(sideButton("My id", Gravity.END) { showSetup() })
+            addView(sideButton("", Gravity.END) {})
         }
 
         statusView = status
         stateView = state
         stateDot = dot
-        satValue = sat
-        accValue = acc
-        timeLabel = timeL
-        timeValue = timeV
         shutter = take
         setScreen(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -356,57 +708,22 @@ class MainActivity : ComponentActivity() {
         refreshStatus()
     }
 
-    private fun showPhotos() {
+    private fun showSaved(customer: PackCustomer) {
         stopCamera()
-        val rows = mutableListOf<View>(
-            heading("Sealed photos", "Photos to send"),
-            body("Send each photo to the System Administrator on WhatsApp as a Document, not as a photo, so the seal arrives whole."),
-            gap(16),
-        )
-        val files = sealedFiles()
-        if (files.isEmpty()) {
-            rows += card(
-                micro("Nothing to send"),
-                gap(6),
-                body("No photos yet. A photo can be sent for 72 hours after it is taken."),
-                gap(8),
-                wave = true,
-            )
-        }
-        for (file in files) {
-            rows += photoCard(file)
-            rows += gap(14)
-        }
-        rows += gap(6)
-        rows += primaryButton("Back to the camera") { showCamera() }
-        rows += gap(10)
-        rows += outlineButton("Change my HR id or name") { showSetup() }
-        setScreen(page(*rows.toTypedArray()))
-    }
-
-    private fun showSealed(file: File) {
-        stopCamera()
-        val image = ImageView(this).apply {
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            setImageBitmap(decodeSampled(file, 1600))
-            setBackgroundColor(navy)
-        }
+        screen = Screen.OTHER
+        draft = null
         setScreen(page(
-            heading("Sealed", "The photo is sealed"),
-            card(image, wave = false, padded = false),
-            gap(16),
-            body("Send it to the System Administrator on WhatsApp as a Document, not as a photo, so the seal arrives whole. " +
-                "With no signal here, send it from \"Photos to send\" once you have one, within 72 hours."),
-            gap(18),
-            primaryButton("Send as a Document") { share(file) },
-            gap(10),
-            outlineButton("Take another photo") { showCamera() },
+            heading("Saved", "The visit is saved"),
+            body("${customer.name}: the visit and its photo are on the phone. They send themselves to Phoenix when there is network; you do not need to send anything."),
+            gap(20),
+            primaryButton("Next visit") { showHome() },
         ))
+        checkNetwork()
     }
 
     private fun showMessage(title: String, message: String, action: String?, onAction: (() -> Unit)?) {
         stopCamera()
+        screen = Screen.OTHER
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -454,6 +771,7 @@ class MainActivity : ComponentActivity() {
 
     /** Null when a photo can be taken now; otherwise what stops it. The location never holds the shutter back. */
     private fun blocker(): String? {
+        if (online == true) return "You have network. Record this visit in the main account."
         val current = watch ?: return "Starting the location…"
         if (!current.locationOn()) return "Switch Location on in the phone's settings."
         if (current.mockSeen()) return "A fake-location app is giving the position. Switch it off to take the photo."
@@ -474,17 +792,10 @@ class MainActivity : ComponentActivity() {
 
         stateDot?.background = ColorDrawable(if (locked != null) orange else disabledText)
         stateView?.text = when {
-            busy -> "SEALING THE PHOTO"
+            busy -> "SAVING THE VISIT"
             locked != null -> "LOCATION LOCKED"
             shown != null -> "LOCATION SETTLING"
             else -> "FINDING THE LOCATION"
-        }
-        satValue?.text = "${current.satellites.used} / ${current.satellites.seen}"
-        accValue?.text = shown?.let { "${PositionWatch.radius98(it.location.accuracy).roundToInt()} m" } ?: "—"
-        timeValue?.text = when (shown?.source) {
-            null -> "—"
-            "gps" -> "Satellites"
-            else -> "Wi-Fi + GPS"
         }
         if (!busy) {
             statusView?.text = problem ?: if (locked != null) {
@@ -499,6 +810,7 @@ class MainActivity : ComponentActivity() {
     private fun capture() {
         val current = watch ?: return
         val use = imageCapture ?: return
+        val visit = draft ?: return
         if (blocker() != null || busy) return
         if (PhoneChecks.mockAppActive(this)) {
             toast("A fake-location app is switched on in this phone. Switch it off to take the photo.")
@@ -513,7 +825,7 @@ class MainActivity : ComponentActivity() {
                 val photo = runCatching { Sealer.upright(image.toBitmap(), image.imageInfo.rotationDegrees) }
                 image.close()
                 runOnUiThread {
-                    photo.onSuccess { lockThenSeal(it, shot) }.onFailure {
+                    photo.onSuccess { lockThenSeal(it, shot, visit) }.onFailure {
                         busy = false
                         toast("The camera did not take the photo. Try again.")
                         refreshStatus()
@@ -536,7 +848,7 @@ class MainActivity : ComponentActivity() {
      * ([EXACT_M]); after [LOCK_WAIT_MS] the best reading within [MAX_M] is taken; with none the rep is told where to
      * stand and the photo is not kept.
      */
-    private fun lockThenSeal(photo: Bitmap, shot: Shot) {
+    private fun lockThenSeal(photo: Bitmap, shot: Shot, visit: VisitDraft) {
         val poll = object : Runnable {
             override fun run() {
                 val current = watch
@@ -556,43 +868,42 @@ class MainActivity : ComponentActivity() {
                 val best = current.best(shot.shutterNanos, BEFORE_MS, LOCK_WAIT_MS)
                 val chosen = exact ?: if (sinceMs >= LOCK_WAIT_MS) best?.takeIf { it.location.accuracy <= MAX_M } else null
                 when {
-                    chosen != null -> sealInBackground(photo, chosen, shot)
+                    chosen != null -> sealInBackground(photo, chosen, shot, visit)
                     sinceMs >= LOCK_WAIT_MS -> {
                         busy = false
-                        val sure = best?.let { "The phone is only sure of the place to ${PositionWatch.radius98(it.location.accuracy).roundToInt()} m. " } ?: ""
                         showMessage(
-                            "The location is not exact enough here",
-                            sure + "Step near a window or the door for a moment, then take the photo again.",
+                            "The location did not lock here",
+                            "Step near a window or the door for a moment, then take the photo again.",
                             "Back to the camera",
                         ) { showCamera() }
                     }
-                    else -> {
-                        statusView?.text = "Photo taken. Locking the location" +
-                            (best?.let { " · ${PositionWatch.radius98(it.location.accuracy).roundToInt()} m so far" } ?: "…")
-                        ticker.postDelayed(this, 250L)
-                    }
+                    else -> ticker.postDelayed(this, 250L)
                 }
             }
         }
         ticker.post(poll)
     }
 
-    private fun sealInBackground(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot) {
-        statusView?.text = "Sealing the photo…"
+    private fun sealInBackground(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot, visit: VisitDraft) {
+        statusView?.text = "Saving the visit…"
         worker.execute {
-            val result = runCatching { seal(photo, fix, shot) }
+            val result = runCatching {
+                val file = seal(photo, fix, shot, visit)
+                FieldStore.enqueue(this, visit.visitId, file.name, visit.body, visit.customer.name)
+            }
             runOnUiThread {
                 busy = false
-                result.onSuccess { showSealed(it) }.onFailure {
-                    toast("The photo could not be sealed: ${it.message ?: "try again"}")
+                result.onSuccess { showSaved(visit.customer) }.onFailure {
+                    toast("The visit could not be saved: ${it.message ?: "try again"}")
                     refreshStatus()
                 }
             }
         }
     }
 
-    private fun seal(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot): File {
+    private fun seal(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot, visit: VisitDraft): File {
         SealKey.ensure()
+        val pack = FieldStore.pack(this) ?: throw IllegalStateException("sign in again")
         val sinceShutterMs = (SystemClock.elapsedRealtimeNanos() - shot.shutterNanos) / 1_000_000
         // Positive: the reading was taken before the shutter; negative: just after it, while the location locked.
         val fixAgeMs = -fix.offsetMs(shot.shutterNanos)
@@ -608,16 +919,21 @@ class MainActivity : ComponentActivity() {
         }
         val takenAt = Instant.ofEpochMilli(takenMs)
         val used = if (fix.source == "gps") fix.satellites else shot.satellitesUsed
-        val radius = PositionWatch.radius98(fix.location.accuracy).roundToInt()
 
-        val stamped = Sealer.stamp(photo, listOfNotNull(
+        // The stamp names when, whom and who; the place and its accuracy travel in the seal, read above the rep.
+        val stamped = Sealer.stamp(photo, listOf(
             "${takenAt.atZone(cairo).format(stampTime)} Cairo · $timeWords",
-            "%.6f, %.6f · 98%% within %d m".format(Locale.ENGLISH, fix.location.latitude, fix.location.longitude, radius) +
-                (if (used > 0) " · $used satellites" else ""),
+            visit.customer.name,
             "${repName()} (${repHrId()})",
             "Phoenix Camera · sealed",
         ))
         val jpeg = Sealer.encode(stamped)
+
+        val visitBlock = JSONObject()
+            .put("seatId", pack.seatId)
+            .put("customerId", visit.customer.customerId)
+            .put("visitId", visit.visitId)
+            .put("offline", PhoenixApi.offlineClock(this, shot.shutterNanos / 1_000_000) ?: JSONObject.NULL)
 
         val nonce = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
         val payload = JSONObject()
@@ -647,25 +963,14 @@ class MainActivity : ComponentActivity() {
             .put("deviceModel", "${Build.MANUFACTURER} ${Build.MODEL}".take(120))
             .put("androidSdk", Build.VERSION.SDK_INT)
             .put("nonce", nonce)
+            .put("visit", visitBlock)
             .toString()
 
         val signature = SealKey.sign(payload.toByteArray(Charsets.UTF_8))
         val bytes = Sealer.assemble(jpeg, payload, signature, SealKey.chain())
-        val folder = File(filesDir, "sealed").apply { mkdirs() }
-        val file = File(folder, "Phoenix-Camera-${takenAt.atZone(cairo).format(fileTime)}.jpg")
+        val file = FieldStore.sealedFile(this, "Phoenix-Camera-${takenAt.atZone(cairo).format(fileTime)}-${visit.visitId.take(8)}.jpg")
         file.writeBytes(bytes)
         return file
-    }
-
-    private fun share(file: File) {
-        val uri = FileProvider.getUriForFile(this, "com.satopharma.phoenixcamera.files", file)
-        val send = Intent(Intent.ACTION_SEND).apply {
-            // A generic type makes WhatsApp send it as a Document, so the photo is never re-compressed.
-            type = "application/octet-stream"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(send, "Send as a Document"))
     }
 
     // ── Small helpers ────────────────────────────────────────────────────────────────────────────────────────
@@ -675,44 +980,35 @@ class MainActivity : ComponentActivity() {
         statusView = null
         stateView = null
         stateDot = null
-        satValue = null
-        accValue = null
-        timeLabel = null
-        timeValue = null
         shutter = null
         runCatching { ProcessCameraProvider.getInstance(this).get().unbindAll() }
     }
 
-    private fun sealedFiles(): List<File> =
-        (File(filesDir, "sealed").listFiles()?.toList() ?: emptyList()).sortedByDescending { it.lastModified() }
-
     /** Phoenix refuses a seal older than 72 hours, so the phone does not keep one. */
     private fun dropExpiredPhotos() {
         val cutoff = System.currentTimeMillis() - 72L * 3_600_000L
-        sealedFiles().filter { it.lastModified() < cutoff }.forEach { it.delete() }
+        (File(filesDir, "sealed").listFiles()?.toList() ?: emptyList()).filter { it.lastModified() < cutoff }.forEach { it.delete() }
     }
 
-    private fun prefs() = getSharedPreferences("rep", Context.MODE_PRIVATE)
-    private fun repHrId(): String = prefs().getString("hrId", "") ?: ""
-    private fun repName(): String = prefs().getString("name", "") ?: ""
+    private fun repHrId(): String = PhoenixApi.hrId(this)
+    private fun repName(): String = FieldStore.pack(this)?.repName ?: ""
 
     private fun appVersion(): String = runCatching {
         packageManager.getPackageInfo(packageName, 0).versionName
-    }.getOrNull() ?: "1.0.0"
+    }.getOrNull() ?: "2.0.0"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
-    private fun clock(seconds: Long): String = "%d:%02d".format(Locale.ENGLISH, seconds / 60, seconds % 60)
-
-    /** A picture small enough for the screen; a sealed file is a JPEG with the seal after its end, which decoders skip. */
-    private fun decodeSampled(file: File, maxSide: Int): Bitmap? {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(file.absolutePath, bounds)
-        var sample = 1
-        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
-        return BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+    /** A multi-line box for the comment, dressed like the single-line fields. */
+    private fun area(hint: String) = field(hint, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES, "").apply {
+        setSingleLine(false)
+        minLines = 3
+        maxLines = 8
+        gravity = Gravity.TOP or Gravity.START
+        typeface = regular
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
     }
 
     // ── The Phoenix look: square corners, flat colour, Montserrat, the signature card's wave and diamond ────────
@@ -907,51 +1203,6 @@ class MainActivity : ComponentActivity() {
                 }
             })
         }
-    }
-
-    private fun photoCard(file: File): View {
-        val taken = Instant.ofEpochMilli(file.lastModified()).atZone(cairo)
-        val until = taken.plusHours(72)
-        val thumb = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(navy)
-            setImageBitmap(decodeSampled(file, 320))
-            layoutParams = LinearLayout.LayoutParams(dp(92), dp(92)).apply { rightMargin = dp(14) }
-        }
-        val text = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addView(micro("Sealed · ${taken.format(listTime)} Cairo"))
-            addView(TextView(this@MainActivity).apply {
-                text = taken.format(listDay)
-                typeface = bold
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                setTextColor(navy)
-                setPadding(0, dp(6), 0, dp(2))
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "Send by ${until.format(listDay)}, ${until.format(listTime)}"
-                typeface = regular
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                setTextColor(inkSoft)
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "SEND AS A DOCUMENT"
-                typeface = bold
-                letterSpacing = 0.12f
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                setTextColor(orange)
-                setPadding(0, dp(12), dp(12), dp(6))
-                setOnClickListener { share(file) }
-            })
-        }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 0, 0, dp(16))
-            addView(thumb)
-            addView(text)
-        }
-        return card(row, wave = true)
     }
 
     private fun field(hint: String, type: Int, value: String) = EditText(this).apply {
