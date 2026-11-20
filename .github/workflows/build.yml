@@ -100,8 +100,8 @@ jobs:
           script: |
             adb install -r "$(ls Phoenix-Camera-*.apk | head -n 1)" 2>&1 | tee install.txt; grep -q Success install.txt
             adb shell dumpsys package com.satopharma.phoenixcamera | grep -E "versionCode|versionName"
-            adb shell pm grant com.satopharma.phoenixcamera android.permission.CAMERA
-            adb shell pm grant com.satopharma.phoenixcamera android.permission.ACCESS_FINE_LOCATION
+            adb shell pm grant com.satopharma.phoenixcamera android.permission.CAMERA || true
+            adb shell pm grant com.satopharma.phoenixcamera android.permission.ACCESS_FINE_LOCATION || true
             adb logcat -c
             adb shell am start -W -n com.satopharma.phoenixcamera/.MainActivity
             sleep 10
