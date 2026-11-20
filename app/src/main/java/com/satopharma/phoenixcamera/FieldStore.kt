@@ -24,7 +24,7 @@ class PackOption(val value: String, val label: String)
 
 /**
  * What the main account's new-customer form offers (camera 2.2): the customer types, the specialities, and the types
- * that need a speciality. Absent on an older Phoenix, and then the camera keeps sending the rep to the main account.
+ * that need a speciality. When the saved list carries none, [DEFAULT] stands in (camera 2.2.1).
  */
 class NewCustomerOptions(
     val customerTypes: List<PackOption>,
@@ -32,6 +32,25 @@ class NewCustomerOptions(
     val typesWithSpeciality: Set<String>,
 ) {
     companion object {
+        /**
+         * The same choices Phoenix sends (speciality-list.ts in phoenix-workforce: every customer type but Pharmacy, the
+         * doctor specialities, Clinic and Polyclinic carrying one). The form uses them when the saved list is older than
+         * the form itself, so Add new customer works with no network from the first day (owner, 21 Nov 2026: "make him
+         * able to add new customer even if offline"). Phoenix still checks every value it receives.
+         */
+        val DEFAULT = NewCustomerOptions(
+            customerTypes = listOf(
+                "Clinic", "Polyclinic", "Hospital", "Private Hospital", "University Hospital", "Educational Hospital",
+                "Armed Forces Hospital", "Police Hospital", "Contract", "Health Insurance", "Educational Institute",
+            ).map { PackOption(it, it) },
+            specialities = listOf(
+                "Internal Medicine", "Pediatrics", "ENT", "Neurology", "Chest", "General Practitioner", "Urology",
+                "General Surgery", "Psychiatry", "Neuro Surgery", "Vascular Surgery", "Gastroenterologist", "Ophthalmologist",
+                "Neuropedia", "Cardiology", "NICU", "Orthopedic Surgery", "Tropical Medicine", "Dermatologist", "Nephrology",
+            ).map { PackOption(it, it) },
+            typesWithSpeciality = setOf("Clinic", "Polyclinic"),
+        )
+
         fun parse(json: JSONObject?): NewCustomerOptions? {
             if (json == null) return null
             fun options(array: JSONArray?): List<PackOption> = (0 until (array?.length() ?: 0)).mapNotNull { index ->
@@ -84,7 +103,7 @@ class Pack(
     val products: List<String>,
     val people: List<PackPerson>,
     val customers: List<PackCustomer>,
-    /** Null on an older Phoenix: the new-customer form is then not offered. */
+    /** Phoenix's choices, or the built-in ones when the saved list predates them: never null since camera 2.2.1. */
     val newCustomerOptions: NewCustomerOptions?,
     /** The newest Phoenix Camera Phoenix has published, or null (camera 2.2: the "Update the app" button). */
     val latestApp: LatestApp?,
@@ -118,7 +137,7 @@ class Pack(
                         validated = c.optBoolean("validated", true),
                     )
                 },
-                newCustomerOptions = NewCustomerOptions.parse(json.optJSONObject("newCustomerOptions")),
+                newCustomerOptions = NewCustomerOptions.parse(json.optJSONObject("newCustomerOptions")) ?: NewCustomerOptions.DEFAULT,
                 latestApp = LatestApp.parse(json.optJSONObject("latestApp")),
             )
         }

@@ -34,6 +34,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -157,6 +158,11 @@ class MainActivity : ComponentActivity() {
     private var needsSignIn = false
     private var lastRefreshMs = 0L
     private var sending = false
+    /** Where Back goes from the screen on show, or null where there is nowhere to go back to (the home screen). */
+    private var backAction: (() -> Unit)? = null
+    /** Draws the screen on show again after Refresh; null on a screen with typing in it, which is never redrawn. */
+    private var redraw: (() -> Unit)? = null
+    private var refreshing = false
 
     private val ticker = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
@@ -224,6 +230,19 @@ class MainActivity : ComponentActivity() {
             Notifier.refresh(this)
         }
         SendWork.schedule(this)
+        // The phone's own Back key goes where the Back button at the top goes; on the home screen it leaves the app.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val back = backAction
+                if (back != null) {
+                    back()
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                    isEnabled = true
+                }
+            }
+        })
         showSplash()
         permissions.launch(asked())
     }
@@ -312,6 +331,8 @@ class MainActivity : ComponentActivity() {
 
     private fun showStart() {
         screen = Screen.START
+        backAction = null
+        redraw = null
         val granted = permitted()
         if (granted) startWatch()
         when {
@@ -345,6 +366,8 @@ class MainActivity : ComponentActivity() {
     private fun showLogin(note: String?) {
         stopCamera()
         screen = Screen.LOGIN
+        backAction = null
+        redraw = null
         val hrId = field("For example B-182", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS, PhoenixApi.hrId(this))
         val password = field("Your Phoenix password", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD, "").apply {
             // After the single-line dressing, which would otherwise show the password.
@@ -423,6 +446,8 @@ class MainActivity : ComponentActivity() {
     private fun showHome() {
         stopCamera()
         screen = Screen.HOME
+        backAction = null
+        redraw = { showHome() }
         draft = null
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val rows = mutableListOf<View>()
@@ -533,6 +558,8 @@ class MainActivity : ComponentActivity() {
     private fun showList(planned: Boolean) {
         stopCamera()
         screen = Screen.LIST
+        backAction = { showHome() }
+        redraw = { showList(planned) }
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val all = pack.customers.filter { it.plannedToday == planned }.sortedBy { it.name }
         val listColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -595,6 +622,8 @@ class MainActivity : ComponentActivity() {
     private fun showForm(customer: PackCustomer, planned: Boolean) {
         stopCamera()
         screen = Screen.FORM
+        backAction = { showList(planned) }
+        redraw = null
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val chosenPeople = linkedSetOf<String>()
         val chosenProducts = linkedSetOf<String>().apply { addAll(customer.lastProducts.filter { it in pack.products }) }
@@ -711,6 +740,8 @@ class MainActivity : ComponentActivity() {
     private fun showValidateList() {
         stopCamera()
         screen = Screen.LIST
+        backAction = { showHome() }
+        redraw = { showValidateList() }
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val all = pack.customers.filter { !it.validated }.sortedBy { it.name }
         val listColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -759,6 +790,8 @@ class MainActivity : ComponentActivity() {
     private fun showNewCustomer(state: NewCustomerState) {
         stopCamera()
         screen = Screen.NEW_CUSTOMER
+        backAction = { showHome() }
+        redraw = null
         val pack = FieldStore.pack(this) ?: return showLogin(null)
         val options = pack.newCustomerOptions ?: return showHome()
 
@@ -984,6 +1017,8 @@ class MainActivity : ComponentActivity() {
     private fun showPhotoKind(visit: VisitDraft) {
         stopCamera()
         screen = Screen.KIND
+        backAction = { visit.back() }
+        redraw = null
         val kinds = listOf(
             "place" to "Clinic sign or door",
             "door_sign" to "Doctor's name on his room door",
@@ -1041,6 +1076,8 @@ class MainActivity : ComponentActivity() {
     private fun showCamera() {
         val visit = draft ?: return showHome()
         screen = Screen.CAMERA
+        backAction = { if (!busy) { if (visit.validated) visit.back() else showPhotoKind(visit) } }
+        redraw = null
         val preview = PreviewView(this).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1110,6 +1147,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(navy)
             addView(header(showRep = true))
+            navBar()?.let { addView(it) }
             addView(viewfinder)
             addView(hRule(orange, 2))
             addView(band)
@@ -1135,6 +1173,8 @@ class MainActivity : ComponentActivity() {
     private fun showSaved(visit: VisitDraft, locationPending: Boolean) {
         stopCamera()
         screen = Screen.OTHER
+        backAction = { showHome() }
+        redraw = null
         draft = null
         val what = when (visit.intent) {
             "validate" -> "the photo for his place is"
@@ -1157,6 +1197,8 @@ class MainActivity : ComponentActivity() {
     private fun showMessage(title: String, message: String, action: String?, onAction: (() -> Unit)?) {
         stopCamera()
         screen = Screen.OTHER
+        backAction = null
+        redraw = null
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -1417,6 +1459,55 @@ class MainActivity : ComponentActivity() {
         ViewCompat.requestApplyInsets(root)
     }
 
+    /**
+     * Back and Refresh at the top of every screen (owner, 21 Nov 2026: "make a refresh button and back button at the top
+     * in the app"). Back goes where the screen's own Back goes; Refresh reads the list and the plan again from Phoenix and
+     * sends whatever is waiting. Neither shows on the sign-in screen, which has nowhere to go back to and nothing to read.
+     */
+    private fun navBar(): View? {
+        val back = backAction
+        val canRefresh = screen != Screen.LOGIN && screen != Screen.START && FieldStore.pack(this) != null
+        if (back == null && !canRefresh) return null
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(navyRaised)
+            setPadding(dp(18), 0, dp(18), 0)
+            addView(if (back != null) sideButton("Back", Gravity.START) { back() } else spacer())
+            addView(if (canRefresh) sideButton("Refresh", Gravity.END) { refreshNow() } else spacer())
+        }
+    }
+
+    private fun spacer() = View(this).apply { layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f) }
+
+    /** Refresh: the list, the plan and the newest version from Phoenix now, then everything waiting is sent. */
+    private fun refreshNow() {
+        if (refreshing) return
+        refreshing = true
+        toast("Refreshing from Phoenix")
+        net.execute {
+            val words = when {
+                !PhoenixApi.reachable() -> "No network here. Everything you take stays on the phone and sends itself when there is network."
+                PhoenixApi.token(this) == null -> "Sign in again to refresh."
+                else -> runCatching {
+                    val pack = PhoenixApi.pack(this)
+                    FieldStore.savePack(this, pack)
+                    PhoenixApi.refreshAnchor(this, pack.getString("seatId"))
+                    lastRefreshMs = System.currentTimeMillis()
+                }.fold(
+                    { "Your list and plan are up to date." },
+                    { error -> (error as? PhoenixApi.Refused)?.message ?: "Phoenix did not answer. Try again in a moment." },
+                )
+            }
+            runOnUiThread {
+                refreshing = false
+                toast(words)
+                redraw?.invoke()
+                checkNetwork()
+            }
+        }
+    }
+
     /** Navy header, cream page that scrolls. */
     private fun page(vararg views: View): View {
         val column = LinearLayout(this).apply {
@@ -1428,6 +1519,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(navy)
             addView(header(showRep = false))
+            navBar()?.let { addView(it) }
             addView(hRule(orange, 2))
             addView(ScrollView(this@MainActivity).apply {
                 setBackgroundColor(cream)

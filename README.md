@@ -16,6 +16,17 @@ The rep never waits for the location. It starts the moment the app opens, from t
 polyclinic) beside the satellites alone, and the last ten minutes of readings are kept. The shutter is always live.
 The seal carries the reading; Phoenix reads the 98% radius (Android's own accuracy figure is a 68% radius, 1.85 times narrower).
 
+## 2.2.1
+
+- **Back and Refresh at the top of every screen** (owner, 21 Nov 2026: "make a refresh button and back button at the
+  top in the app"). A navy bar under the header: Back goes where the screen's own Back goes (the phone's Back key does
+  the same; on the home screen it leaves the app), and Refresh reads the list, the plan and the newest version from
+  Phoenix now and sends whatever is waiting. No network: it says so, and nothing is lost. Neither shows on sign-in.
+- **Add new customer works with no network from the first day** (owner, 21 Nov 2026: "make him able to add new
+  customer even if offline"). A list saved before Phoenix sent the new-customer choices used to send the rep to the
+  main account; the camera now carries the same choices itself (`NewCustomerOptions.DEFAULT`, the lists in
+  phoenix-workforce's `speciality-list.ts`) and Phoenix still checks every value it receives.
+
 ## 2.2.0
 
 - **Add a new customer and validate a customer with no network**, the same way as a visit (owner, 20 Nov 2026:
