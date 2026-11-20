@@ -1026,9 +1026,9 @@ class MainActivity : ComponentActivity() {
 }
 
 /** The signature card's foot: a navy wave with an orange stroke along its crest (M0 18 C100 28 260 28 390 8). */
-private class Wave(context: Context, navy: Int, orange: Int, private val strokeWidth: Float) : View(context) {
-    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = navy; style = Paint.Style.FILL }
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = orange; style = Paint.Style.STROKE; this.strokeWidth = strokeWidth }
+private class Wave(context: Context, waveColor: Int, crestColor: Int, crestWidth: Float) : View(context) {
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = waveColor; style = Paint.Style.FILL }
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = crestColor; style = Paint.Style.STROKE; strokeWidth = crestWidth }
 
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
@@ -1050,8 +1050,8 @@ private class Wave(context: Context, navy: Int, orange: Int, private val strokeW
 }
 
 /** Four square corner marks over the live picture, like a viewfinder. */
-private class FrameMarks(context: Context, color: Int, private val thickness: Float, private val length: Float, private val inset: Float) : View(context) {
-    private val paint = Paint().apply { this.color = color; style = Paint.Style.FILL }
+private class FrameMarks(context: Context, markColor: Int, private val thickness: Float, private val length: Float, private val inset: Float) : View(context) {
+    private val paint = Paint().apply { color = markColor; style = Paint.Style.FILL }
 
     override fun onDraw(canvas: Canvas) {
         val l = inset
