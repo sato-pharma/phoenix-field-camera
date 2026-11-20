@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <files-path name="sealed" path="sealed/" />
+    <!-- 2.2: the downloaded update, handed to Android's installer. The visits waiting to send never live in the cache. -->
+    <cache-path name="updates" path="updates/" />
 </paths>

@@ -93,8 +93,9 @@ object Pending {
                     context,
                     visitId,
                     sealedFile.name,
-                    meta.getJSONObject("draft"),
+                    meta.optJSONObject("draft"),
                     meta.optString("customerName"),
+                    intentOf(meta),
                 )
                 photo.delete()
                 File(folder(context), "$visitId.json").delete()
@@ -118,6 +119,9 @@ object Pending {
             .minByOrNull { it.offsetMs(shutterNanos) }
     }
 
+    /** "visit", "validate" or "new_customer"; an item from before 2.2 is a visit. */
+    fun intentOf(meta: JSONObject): String = meta.optString("intent", "visit").ifBlank { "visit" }
+
     /** [fixAgeMs] is the shutter minus the reading's time: positive before the shutter. */
     private fun statusOf(fixAgeMs: Long): String = when {
         fixAgeMs > LOCKED_BEFORE_MS -> "cached"
@@ -137,6 +141,9 @@ object Pending {
             .put("visitId", visitId)
             .put("offline", meta.optJSONObject("offline") ?: JSONObject.NULL)
             .put("photoKind", meta.optString("photoKind", "place").ifBlank { "place" })
+            .put("intent", intentOf(meta))
+        // A new customer: everything the rep typed travels inside the signed block, never beside it (camera 2.2).
+        meta.optJSONObject("newCustomer")?.let { visitBlock.put("newCustomer", it) }
 
         fun orNull(value: Any?): Any = value ?: JSONObject.NULL
         val usedAtShutter = if (meta.has("satellitesUsed")) meta.optInt("satellitesUsed") else null
@@ -184,5 +191,5 @@ object Pending {
 
     private fun appVersion(context: Context): String = runCatching {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
-    }.getOrNull() ?: "2.1.0"
+    }.getOrNull() ?: "2.2.0"
 }

@@ -103,7 +103,7 @@ object Notifier {
     private fun channels(context: Context) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
         manager.createNotificationChannel(
-            NotificationChannel(SENDING, "Visits waiting to be sent", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(SENDING, "Waiting to be sent", NotificationManager.IMPORTANCE_LOW),
         )
         manager.createNotificationChannel(
             NotificationChannel(REMINDERS, "Reminders", NotificationManager.IMPORTANCE_DEFAULT),
@@ -149,7 +149,7 @@ object Notifier {
     /** The one "waiting" notification, shown while anything is waiting and cleared when the phone is empty. */
     fun refresh(context: Context) {
         if (anythingWaiting(context)) {
-            show(context, WAITING_ID, SENDING, "Visits waiting to be sent", "They send themselves to Phoenix when there is network.", quiet = true)
+            show(context, WAITING_ID, SENDING, "Waiting to be sent", "They send themselves to Phoenix when there is network.", quiet = true)
         } else {
             cancel(context, WAITING_ID)
             cancel(context, REMINDER_ID)
@@ -168,7 +168,7 @@ object Notifier {
         val prefs = context.getSharedPreferences("reminder", Context.MODE_PRIVATE)
         val today = now.toLocalDate().toString()
         if (prefs.getString("day", null) == today) return
-        show(context, REMINDER_ID, REMINDERS, "Visits waiting to be sent", "Connect to the network to send today's visits.", quiet = false)
+        show(context, REMINDER_ID, REMINDERS, "Waiting to be sent", "Connect to the network to send today's visits.", quiet = false)
         prefs.edit().putString("day", today).apply()
     }
 }

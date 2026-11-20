@@ -16,6 +16,33 @@ The rep never waits for the location. It starts the moment the app opens, from t
 polyclinic) beside the satellites alone, and the last ten minutes of readings are kept. The shutter is always live.
 The seal carries the reading; Phoenix reads the 98% radius (Android's own accuracy figure is a 68% radius, 1.85 times narrower).
 
+## 2.2.0
+
+- **Add a new customer and validate a customer with no network**, the same way as a visit (owner, 20 Nov 2026:
+  "there are bricks that have no network"). Beside Planned and Unplanned the home screen offers "Add new customer"
+  and "Validate a customer". With network the camera still sends the rep to the main account.
+  - *Validate a customer:* the pack's customers with no place yet, then the photo-kind choice and the camera. No visit
+    form. The seal's visit block says `intent: "validate"`, with the customer's id and a fresh `visitId`.
+  - *Add new customer:* the main account's form: AM or PM; for PM the first, middle and last name, for AM one name of
+    at least 3 letters; the customer type (Clinic by default for PM); the speciality where the type needs one; the
+    proposed grade A, B or C; an optional phone. Then the photo-kind choice and the camera. The seal's visit block says
+    `intent: "new_customer"` with a phone-made `customerId`, a fresh `visitId` and `newCustomer` holding everything
+    typed, so it is all signed. The choices come from the pack's `newCustomerOptions`; on an older Phoenix without
+    them the camera keeps sending the rep to the main account.
+  - Both take the same never-lost, pending-location and background-send path as a visit, and go for approval in
+    Phoenix. A visit's seal now says `intent: "visit"` (a seal without one is a visit). The sync carries a visit form
+    for visits only.
+  - The rep reads only "Saved", "Location pending" and "Waiting to be sent".
+- **The "Update the app" button.** When the pack's `latestApp` names a newer version than the one installed, the home
+  screen says "A new version of Phoenix Camera is ready" with one button. Only when the rep presses it, the APK is
+  downloaded from the pack's short-lived signed link into the app's cache (a fresh pack is read first where Phoenix
+  answers), its size and SHA-256 are checked against the pack (any difference deletes it: "The update did not
+  download whole. Try again."), and it is handed to Android's own installer. The first time, Android asks the rep to
+  allow "Install unknown apps" for Phoenix Camera; the app opens that setting and continues when he comes back.
+  Android refuses an APK signed with another key. Nothing downloads in the background. The update keeps the same
+  package and key, so the app's data stays, and the visits waiting to send live in the app's private files folder,
+  never in the cache.
+
 ## 2.1.0
 
 - **The photo is never lost.** The shutter stores the stamped photo and everything known at that instant in the app's

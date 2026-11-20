@@ -19,6 +19,59 @@ class PackCustomer(
     val validated: Boolean,
 )
 
+/** One choice Phoenix offers on the new-customer form: what is sent, and what the rep reads. */
+class PackOption(val value: String, val label: String)
+
+/**
+ * What the main account's new-customer form offers (camera 2.2): the customer types, the specialities, and the types
+ * that need a speciality. Absent on an older Phoenix, and then the camera keeps sending the rep to the main account.
+ */
+class NewCustomerOptions(
+    val customerTypes: List<PackOption>,
+    val specialities: List<PackOption>,
+    val typesWithSpeciality: Set<String>,
+) {
+    companion object {
+        fun parse(json: JSONObject?): NewCustomerOptions? {
+            if (json == null) return null
+            fun options(array: JSONArray?): List<PackOption> = (0 until (array?.length() ?: 0)).mapNotNull { index ->
+                val item = array?.opt(index)
+                when (item) {
+                    is String -> item.takeIf { it.isNotBlank() }?.let { PackOption(it, it) }
+                    is JSONObject -> {
+                        val value = item.optString("value").ifBlank { item.optString("id") }.ifBlank { item.optString("name") }
+                        val label = item.optString("label").ifBlank { item.optString("name") }.ifBlank { value }
+                        value.takeIf { it.isNotBlank() }?.let { PackOption(it, label) }
+                    }
+                    else -> null
+                }
+            }
+            val types = options(json.optJSONArray("customerTypes"))
+            if (types.isEmpty()) return null
+            return NewCustomerOptions(
+                customerTypes = types,
+                specialities = options(json.optJSONArray("specialities")),
+                typesWithSpeciality = options(json.optJSONArray("typesWithSpeciality")).map { it.value }.toSet(),
+            )
+        }
+    }
+}
+
+/** The newest published APK: its version, the SHA-256 and size it must have, and a short-lived signed link. */
+class LatestApp(val versionCode: Long, val versionName: String, val sha256: String, val sizeBytes: Long, val url: String) {
+    companion object {
+        fun parse(json: JSONObject?): LatestApp? {
+            if (json == null) return null
+            val code = json.optLong("versionCode", 0L)
+            val sha = json.optString("sha256").lowercase()
+            val size = json.optLong("sizeBytes", 0L)
+            val url = json.optString("url")
+            if (code <= 0L || !Regex("^[0-9a-f]{64}$").matches(sha) || size <= 0L || !url.startsWith("https://")) return null
+            return LatestApp(code, json.optString("versionName"), sha, size, url)
+        }
+    }
+}
+
 /** Somebody the rep may name on "Who was on the visit". */
 class PackPerson(val hrId: String, val name: String, val side: String)
 
@@ -31,6 +84,10 @@ class Pack(
     val products: List<String>,
     val people: List<PackPerson>,
     val customers: List<PackCustomer>,
+    /** Null on an older Phoenix: the new-customer form is then not offered. */
+    val newCustomerOptions: NewCustomerOptions?,
+    /** The newest Phoenix Camera Phoenix has published, or null (camera 2.2: the "Update the app" button). */
+    val latestApp: LatestApp?,
 ) {
     companion object {
         fun parse(json: JSONObject): Pack {
@@ -61,6 +118,8 @@ class Pack(
                         validated = c.optBoolean("validated", true),
                     )
                 },
+                newCustomerOptions = NewCustomerOptions.parse(json.optJSONObject("newCustomerOptions")),
+                latestApp = LatestApp.parse(json.optJSONObject("latestApp")),
             )
         }
     }
@@ -90,14 +149,18 @@ object FieldStore {
 
     fun sealedFile(context: Context, name: String) = File(sealedFolder(context), name)
 
-    /** Queues one visit: the sealed photo is already on disk; this is what the sync sends beside it. */
-    fun enqueue(context: Context, visitId: String, sealedName: String, draft: JSONObject, customerName: String) {
+    /**
+     * Queues one sealed item: the photo is already on disk. A visit carries its form ([draft]); a validation or a new
+     * customer carries none, since everything it says is inside the seal (camera 2.2).
+     */
+    fun enqueue(context: Context, visitId: String, sealedName: String, draft: JSONObject?, customerName: String, intent: String) {
         val item = JSONObject()
             .put("visitId", visitId)
             .put("file", sealedName)
-            .put("visit", draft)
             .put("customerName", customerName)
+            .put("intent", intent)
             .put("queuedAtMs", System.currentTimeMillis())
+        if (draft != null) item.put("visit", draft)
         val file = File(queueFolder(context), "$visitId.json")
         val temp = File(file.parentFile, "$visitId.json.tmp")
         temp.writeText(item.toString(), Charsets.UTF_8)
@@ -160,7 +223,7 @@ object FieldStore {
         val body = JSONObject()
             .put("seatId", pack.seatId)
             .put("file", Base64.encodeToString(file.readBytes(), Base64.NO_WRAP))
-            .put("visit", item.getJSONObject("visit"))
+        item.optJSONObject("visit")?.let { body.put("visit", it) }
         val reply = try {
             PhoenixApi.sync(context, body)
         } catch (refused: PhoenixApi.Refused) {

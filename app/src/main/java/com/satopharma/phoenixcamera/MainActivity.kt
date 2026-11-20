@@ -61,7 +61,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * The Phoenix Camera 2.1: the rep's own visit app for a clinic with no network (owner, 20 Nov 2026).
+ * The Phoenix Camera 2.2: the rep's own visit app for a clinic with no network (owner, 20 Nov 2026).
  *
  * He signs in with his HR ID and Phoenix password once, with network; the phone then keeps his list, today's plan and
  * the line's products. With no network he chooses Planned or Unplanned, picks the customer, fills the same visit the
@@ -100,14 +100,43 @@ class MainActivity : ComponentActivity() {
         val bootId: String,
     )
 
-    /** The visit a photo is being taken for. */
-    private class VisitDraft(val customer: PackCustomer, val planned: Boolean, val body: JSONObject) {
+    /**
+     * What a photo is being taken for (camera 2.2): a visit ([body] is its form), a validation of a customer with no
+     * place yet, or a new customer ([newCustomer] is everything the rep typed). The last two carry no visit form; all
+     * they say travels inside the seal.
+     */
+    private class VisitDraft(
+        val intent: String,
+        val customerId: String,
+        val customerName: String,
+        /** Phoenix already holds his place: no photo-kind question. */
+        val validated: Boolean,
+        val body: JSONObject?,
+        val newCustomer: JSONObject?,
+        /** Where Back goes from the photo-kind screen (or from the camera when there is none). */
+        val back: () -> Unit,
+    ) {
+        /** The item's own id: the visit's id for a visit, a fresh one for a validation or a new customer. */
         val visitId: String = UUID.randomUUID().toString()
         /** What the photo shows: the place, or, for a customer with no place yet, one of the four doctor's-name photos. */
         var photoKind: String = "place"
     }
 
-    private enum class Screen { START, LOGIN, HOME, LIST, FORM, KIND, CAMERA, OTHER }
+    /** The new-customer form's answers, kept while the rep goes to the photo and back. */
+    private class NewCustomerState {
+        var listType: String? = null
+        var first = ""
+        var middle = ""
+        var last = ""
+        var name = ""
+        var customerType: String? = null
+        var speciality: String? = null
+        var grade: String? = null
+        var phone = ""
+        val customerId: String = UUID.randomUUID().toString()
+    }
+
+    private enum class Screen { START, LOGIN, HOME, LIST, FORM, NEW_CUSTOMER, KIND, CAMERA, OTHER }
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
     private val net: ExecutorService = Executors.newSingleThreadExecutor()
@@ -120,6 +149,8 @@ class MainActivity : ComponentActivity() {
     private var busy = false
     private var screen = Screen.START
     private var draft: VisitDraft? = null
+    /** A checked update waiting for the rep to allow "Install unknown apps" for Phoenix Camera. */
+    private var waitingInstall: File? = null
 
     /** Null until the first answer; true while Phoenix answers. */
     private var online: Boolean? = null
@@ -204,6 +235,7 @@ class MainActivity : ComponentActivity() {
         ticker.post(networkLoop)
         ticker.removeCallbacks(pendingLoop)
         ticker.post(pendingLoop)
+        waitingInstall?.let { file -> if (file.exists() && Updater.mayInstall(this)) installUpdate(file) }
     }
 
     override fun onPause() {
@@ -397,6 +429,19 @@ class MainActivity : ComponentActivity() {
         val waiting = Notifier.anythingWaiting(this)
         val refused = FieldStore.queued(this).filter { it.has("refused") }
 
+        if (Updater.available(this, pack.latestApp)) {
+            val latest = pack.latestApp
+            rows += card(
+                micro("Update the app"),
+                gap(6),
+                body("A new version of Phoenix Camera is ready${latest?.versionName?.takeIf { it.isNotBlank() }?.let { ": $it" } ?: ""}."),
+                gap(14),
+                primaryButton("Update the app") { startUpdate() },
+                gap(16),
+                wave = false,
+            )
+            rows += gap(18)
+        }
         if (online == true) {
             rows += heading("You have network", "Use the main account")
             rows += body("You have network, so record and validate this visit in the main Phoenix account. The camera is for the places with no network.")
@@ -425,16 +470,22 @@ class MainActivity : ComponentActivity() {
             rows += outlineButton("Unplanned visit") { showList(planned = false) }
             rows += gap(10)
             rows += outlineButton("Add new customer") {
-                showMessage(
-                    "Add a new customer",
-                    "A new customer is added from the main account, with network: there you take his place and send him for approval.",
-                    "Back",
-                ) { showHome() }
+                if (pack.newCustomerOptions == null) {
+                    showMessage(
+                        "Add a new customer",
+                        "A new customer is added from the main account, with network: there you take his place and send him for approval.",
+                        "Back",
+                    ) { showHome() }
+                } else {
+                    showNewCustomer(NewCustomerState())
+                }
             }
+            rows += gap(10)
+            rows += outlineButton("Validate a customer") { showValidateList() }
             if (waiting) {
                 rows += gap(16)
                 rows += card(
-                    micro("Visits waiting to be sent"),
+                    micro("Waiting to be sent"),
                     gap(6),
                     body("They are saved on the phone and send themselves to Phoenix when there is network, even with the app closed."),
                     gap(12),
@@ -445,7 +496,11 @@ class MainActivity : ComponentActivity() {
         for (item in refused) {
             rows += gap(14)
             rows += card(
-                micro("Visit"),
+                micro(when (item.optString("intent", "visit")) {
+                    "validate" -> "Validation"
+                    "new_customer" -> "New customer"
+                    else -> "Visit"
+                }),
                 gap(6),
                 TextView(this).apply {
                     text = item.optString("customerName")
@@ -606,7 +661,15 @@ class MainActivity : ComponentActivity() {
                     body.put("companions", JSONArray(people.map { JSONObject().put("hrId", it.hrId).put("side", it.side) }))
                 }
             }
-            val visit = VisitDraft(customer, planned, body)
+            val visit = VisitDraft(
+                intent = "visit",
+                customerId = customer.customerId,
+                customerName = customer.name,
+                validated = customer.validated,
+                body = body,
+                newCustomer = null,
+                back = { showForm(customer, planned) },
+            )
             draft = visit
             if (customer.validated) showCamera() else showPhotoKind(visit)
         }
@@ -642,6 +705,278 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Validate a customer with no network (camera 2.2, owner 20 Nov 2026: "because there are bricks that have no
+     * network"): his place only, no visit. The photo goes for approval in Phoenix exactly as a visit's does.
+     */
+    private fun showValidateList() {
+        stopCamera()
+        screen = Screen.LIST
+        val pack = FieldStore.pack(this) ?: return showLogin(null)
+        val all = pack.customers.filter { !it.validated }.sortedBy { it.name }
+        val listColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun render(query: String) {
+            listColumn.removeAllViews()
+            val shown = all.filter { query.isBlank() || it.name.contains(query, ignoreCase = true) || (it.speciality ?: "").contains(query, ignoreCase = true) }
+            if (shown.isEmpty()) {
+                listColumn.addView(body(if (all.isEmpty()) "Every customer on your list already has his place in Phoenix." else "No customer by that name."))
+            }
+            for (customer in shown) {
+                listColumn.addView(customerRow(customer) {
+                    val visit = VisitDraft(
+                        intent = "validate",
+                        customerId = customer.customerId,
+                        customerName = customer.name,
+                        validated = false,
+                        body = null,
+                        newCustomer = null,
+                        back = { showValidateList() },
+                    )
+                    draft = visit
+                    showPhotoKind(visit)
+                })
+                listColumn.addView(gap(8))
+            }
+        }
+        val search = field("Search by name", InputType.TYPE_CLASS_TEXT, "")
+        search.doAfterTextChanged { render(it?.toString()?.trim() ?: "") }
+        render("")
+        setScreen(page(
+            heading("Validate a customer", "Choose the customer"),
+            body("Customers on your list with no place in Phoenix yet. Take the photo at his clinic; it goes for approval."),
+            gap(14),
+            search,
+            gap(14),
+            listColumn,
+            gap(14),
+            outlineButton("Back") { showHome() },
+        ))
+    }
+
+    /**
+     * Add a new customer with no network (camera 2.2, owner 20 Nov 2026: "the exact same concept of the visit"): the
+     * main account's form, then the photo. Everything typed is sealed with the photo and goes for approval in Phoenix.
+     */
+    private fun showNewCustomer(state: NewCustomerState) {
+        stopCamera()
+        screen = Screen.NEW_CUSTOMER
+        val pack = FieldStore.pack(this) ?: return showLogin(null)
+        val options = pack.newCustomerOptions ?: return showHome()
+
+        val first = field("First name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS, state.first)
+        val middle = field("Middle name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS, state.middle)
+        val last = field("Last name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS, state.last)
+        val name = field("Customer name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS, state.name)
+        val phone = field("Phone (optional)", InputType.TYPE_CLASS_PHONE, state.phone)
+        val pmNames = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(micro("First name", soft = true)); addView(first); addView(gap(12))
+            addView(micro("Middle name", soft = true)); addView(middle); addView(gap(12))
+            addView(micro("Last name", soft = true)); addView(last)
+        }
+        val amName = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(micro("Name", soft = true)); addView(name)
+        }
+        val nameSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val listColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val typeColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val specialityColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val specialitySearch = field("Search the specialities", InputType.TYPE_CLASS_TEXT, "")
+        val specialitySection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(gap(18)); addView(micro("Speciality")); addView(gap(8))
+            addView(specialitySearch); addView(gap(10)); addView(specialityColumn)
+        }
+        val gradeColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        fun needsSpeciality(): Boolean = state.customerType?.let { it in options.typesWithSpeciality } == true
+
+        fun renderSpecialities() {
+            specialityColumn.removeAllViews()
+            val query = specialitySearch.text.toString().trim()
+            val shown = options.specialities.filter { query.isBlank() || it.label.contains(query, ignoreCase = true) || it.value == state.speciality }
+            for (option in shown) {
+                specialityColumn.addView(toggleRow(option.label, state.speciality == option.value) {
+                    state.speciality = option.value
+                    renderSpecialities()
+                })
+            }
+            if (shown.isEmpty()) specialityColumn.addView(body("No speciality by that name."))
+        }
+        specialitySearch.doAfterTextChanged { renderSpecialities() }
+
+        fun renderTypes() {
+            typeColumn.removeAllViews()
+            for (option in options.customerTypes) {
+                typeColumn.addView(toggleRow(option.label, state.customerType == option.value) {
+                    state.customerType = option.value
+                    renderTypes()
+                })
+            }
+            specialitySection.visibility = if (needsSpeciality()) View.VISIBLE else View.GONE
+            if (needsSpeciality()) renderSpecialities()
+        }
+
+        fun renderList() {
+            listColumn.removeAllViews()
+            for ((value, label) in listOf("am" to "AM", "pm" to "PM")) {
+                listColumn.addView(toggleRow(label, state.listType == value) {
+                    state.listType = value
+                    // A PM customer is a clinic unless the rep says otherwise, as in the main account.
+                    if (value == "pm" && state.customerType == null) {
+                        state.customerType = options.customerTypes.firstOrNull {
+                            it.value.equals("Clinic", ignoreCase = true) || it.label.equals("Clinic", ignoreCase = true)
+                        }?.value
+                    }
+                    renderList()
+                    renderTypes()
+                })
+            }
+            nameSection.removeAllViews()
+            when (state.listType) {
+                "pm" -> nameSection.addView(pmNames)
+                "am" -> nameSection.addView(amName)
+            }
+        }
+
+        fun renderGrades() {
+            gradeColumn.removeAllViews()
+            for (grade in listOf("A", "B", "C")) {
+                gradeColumn.addView(toggleRow(grade, state.grade == grade) { state.grade = grade; renderGrades() })
+            }
+        }
+
+        renderList()
+        renderTypes()
+        renderGrades()
+
+        val problem = body("").apply { setTextColor(orangePressed); visibility = View.GONE }
+        fun keepTyped() {
+            state.first = first.text.toString()
+            state.middle = middle.text.toString()
+            state.last = last.text.toString()
+            state.name = name.text.toString()
+            state.phone = phone.text.toString()
+        }
+
+        val take = primaryButton("Take the photo") {
+            keepTyped()
+            val parts = listOf(state.first, state.middle, state.last).map { it.trim().replace(Regex("\\s+"), " ") }
+            val amWords = state.name.trim().replace(Regex("\\s+"), " ")
+            val digits = state.phone.replace(Regex("[\\s-]"), "")
+            val message = when {
+                state.listType == null -> "Choose AM or PM."
+                state.listType == "pm" && parts.any { it.isEmpty() } -> "Write the first, middle and last name."
+                state.listType == "am" && amWords.length < 3 -> "Write the customer's name, at least 3 letters."
+                state.customerType == null -> "Choose the customer type."
+                needsSpeciality() && state.speciality == null -> "Choose the speciality."
+                state.grade == null -> "Choose the proposed grade."
+                digits.isNotEmpty() && !Regex("^[0-9]{7,15}$").matches(digits) -> "Write the phone in digits only, or leave it empty."
+                online == true -> "You have network. Add this customer in the main account."
+                else -> null
+            }
+            if (message != null) {
+                problem.text = message
+                problem.visibility = View.VISIBLE
+                return@primaryButton
+            }
+            val pm = state.listType == "pm"
+            val fullName = if (pm) parts.joinToString(" ") else amWords
+            val newCustomer = JSONObject()
+                .put("listType", state.listType)
+                .put("name", fullName)
+                .put("nameParts", if (pm) JSONObject().put("first", parts[0]).put("middle", parts[1]).put("last", parts[2]) else JSONObject.NULL)
+                .put("customerType", state.customerType)
+                .put("speciality", if (needsSpeciality()) state.speciality else JSONObject.NULL)
+                .put("proposedGrade", state.grade)
+                .put("phone", digits.ifEmpty { null } ?: JSONObject.NULL)
+            val visit = VisitDraft(
+                intent = "new_customer",
+                customerId = state.customerId,
+                customerName = fullName,
+                validated = false,
+                body = null,
+                newCustomer = newCustomer,
+                back = { showNewCustomer(state) },
+            )
+            draft = visit
+            showPhotoKind(visit)
+        }
+
+        setScreen(page(
+            heading("Add new customer", "The new customer"),
+            body("Fill in the customer as in the main account, then take the photo at his clinic. He goes for approval in Phoenix."),
+            gap(16),
+            micro("AM or PM"),
+            gap(8),
+            listColumn,
+            gap(10),
+            nameSection,
+            gap(18),
+            micro("Customer type"),
+            gap(8),
+            typeColumn,
+            specialitySection,
+            gap(18),
+            micro("Proposed grade"),
+            gap(8),
+            gradeColumn,
+            gap(18),
+            micro("Phone", soft = true),
+            phone,
+            gap(14),
+            problem,
+            gap(12),
+            take,
+            gap(10),
+            outlineButton("Back") { showHome() },
+        ))
+    }
+
+    /** The "Update the app" button: only when the rep presses it, never in the background (camera 2.2). */
+    private fun startUpdate() {
+        showMessage("Updating the app", "Downloading the new version of Phoenix Camera. Keep the app open.", null, null)
+        net.execute {
+            // A fresh pack first where Phoenix answers: the download link is short-lived.
+            if (PhoenixApi.token(this) != null) {
+                runCatching { FieldStore.savePack(this, PhoenixApi.pack(this)) }
+            }
+            val latest = FieldStore.pack(this)?.latestApp
+            val result = runCatching {
+                if (latest == null || !Updater.available(this, latest)) null else Updater.download(this, latest)
+            }
+            runOnUiThread {
+                result.onSuccess { file ->
+                    if (file == null) {
+                        showMessage("Up to date", "This is the newest Phoenix Camera.", "Back") { showHome() }
+                    } else {
+                        installUpdate(file)
+                    }
+                }.onFailure { error ->
+                    showMessage("The update did not finish", (error as? Updater.Failed)?.message ?: Updater.INCOMPLETE, "Back") { showHome() }
+                }
+            }
+        }
+    }
+
+    /** Hands the checked APK to Android's installer, after the rep allows Phoenix Camera to install apps. */
+    private fun installUpdate(file: File) {
+        if (!Updater.mayInstall(this)) {
+            waitingInstall = file
+            showMessage(
+                "Allow the update",
+                "Switch on \"Allow from this source\" for Phoenix Camera, then come back here and the update continues.",
+                "Open the setting",
+            ) { runCatching { startActivity(Updater.installSetting(this)) } }
+            return
+        }
+        waitingInstall = null
+        showHome()
+        runCatching { Updater.install(this, file) }.onFailure { toast(Updater.INCOMPLETE) }
+    }
+
+    /**
      * A customer with no place yet (camera 2.1, owner 20 Nov 2026): the rep says what the photo shows. A polyclinic
      * often has no timetable, so the doctor's name in one of four places stands in for it. Phoenix reads it and the
      * System Administrator decides.
@@ -666,13 +1001,17 @@ class MainActivity : ComponentActivity() {
         render()
         setScreen(page(
             heading("The photo", "What will the photo show?"),
-            body("${visit.customer.name} has no place in Phoenix yet. Choose what you will photograph."),
+            body(if (visit.intent == "new_customer") {
+                "${visit.customerName} is a new customer. Choose what you will photograph."
+            } else {
+                "${visit.customerName} has no place in Phoenix yet. Choose what you will photograph."
+            }),
             gap(16),
             column,
             gap(16),
             primaryButton("Open the camera") { showCamera() },
             gap(10),
-            outlineButton("Back") { showForm(visit.customer, visit.planned) },
+            outlineButton("Back") { visit.back() },
         ))
     }
 
@@ -725,7 +1064,7 @@ class MainActivity : ComponentActivity() {
             addView(state)
         }
         val who = TextView(this).apply {
-            text = visit.customer.name
+            text = visit.customerName
             typeface = bold
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             setTextColor(Color.WHITE)
@@ -756,7 +1095,7 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(20), dp(10), dp(20), dp(18))
             addView(sideButton("Back", Gravity.START) {
                 if (!busy) {
-                    if (visit.customer.validated) showForm(visit.customer, visit.planned) else showPhotoKind(visit)
+                    if (visit.validated) visit.back() else showPhotoKind(visit)
                 }
             })
             addView(take)
@@ -793,19 +1132,24 @@ class MainActivity : ComponentActivity() {
         refreshStatus()
     }
 
-    private fun showSaved(customer: PackCustomer, locationPending: Boolean) {
+    private fun showSaved(visit: VisitDraft, locationPending: Boolean) {
         stopCamera()
         screen = Screen.OTHER
         draft = null
+        val what = when (visit.intent) {
+            "validate" -> "the photo for his place is"
+            "new_customer" -> "the new customer and his photo are"
+            else -> "the visit and its photo are"
+        }
         setScreen(page(
-            heading("Saved", if (locationPending) "Location pending" else "The visit is saved"),
+            heading("Saved", if (locationPending) "Location pending" else "Saved"),
             body(if (locationPending) {
-                "${customer.name}: the visit and its photo are on the phone. The location is added by itself; keeping the app open for a moment helps. They send themselves to Phoenix when there is network."
+                "${visit.customerName}: $what on the phone. The location is added by itself; keeping the app open for a moment helps. It sends itself to Phoenix when there is network, for approval where one is needed."
             } else {
-                "${customer.name}: the visit and its photo are on the phone. They send themselves to Phoenix when there is network; you do not need to send anything."
+                "${visit.customerName}: $what on the phone. It sends itself to Phoenix when there is network, for approval where one is needed; you do not need to send anything."
             }),
             gap(20),
-            primaryButton("Next visit") { showHome() },
+            primaryButton("Done") { showHome() },
         ))
         checkNetwork()
     }
@@ -931,7 +1275,7 @@ class MainActivity : ComponentActivity() {
                 }
                 runOnUiThread {
                     busy = false
-                    saved.onSuccess { pending -> showSaved(visit.customer, pending) }.onFailure {
+                    saved.onSuccess { pending -> showSaved(visit, pending) }.onFailure {
                         toast("The camera did not take the photo. Try again.")
                         refreshStatus()
                     }
@@ -969,7 +1313,7 @@ class MainActivity : ComponentActivity() {
         // The stamp names when, whom and who; the place and its accuracy travel in the seal, read above the rep.
         val stamped = Sealer.stamp(photo, listOf(
             "${takenAt.atZone(cairo).format(stampTime)} Cairo · $timeWords",
-            visit.customer.name,
+            visit.customerName,
             "${repName()} (${repHrId()})",
             "Phoenix Camera · sealed",
         ))
@@ -980,10 +1324,12 @@ class MainActivity : ComponentActivity() {
             .put("shutterNanos", shot.shutterNanos)
             .put("bootId", shot.bootId)
             .put("seatId", pack.seatId)
-            .put("customerId", visit.customer.customerId)
-            .put("customerName", visit.customer.name)
+            .put("customerId", visit.customerId)
+            .put("customerName", visit.customerName)
             .put("photoKind", visit.photoKind)
-            .put("draft", visit.body)
+            .put("intent", visit.intent)
+            .put("draft", visit.body ?: JSONObject.NULL)
+            .put("newCustomer", visit.newCustomer ?: JSONObject.NULL)
             .put("hrId", repHrId())
             .put("repName", repName())
             .put("satellitesUsed", shot.satellitesUsed)
