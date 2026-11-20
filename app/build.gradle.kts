@@ -15,8 +15,8 @@ android {
         applicationId = "com.satopharma.phoenixcamera"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "2.2.0"
+        versionCode = 8
+        versionName = "2.2.1"
     }
 
     signingConfigs {
