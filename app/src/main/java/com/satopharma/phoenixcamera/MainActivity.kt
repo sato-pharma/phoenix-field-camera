@@ -17,7 +17,6 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.StateListDrawable
-import android.location.Location
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -61,36 +60,42 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
- * The Phoenix Camera: a live camera only (no gallery), the satellites' position and time, and a seal Phoenix can
- * check. Works with no network at all. The rep sends the file to the System Administrator as a WhatsApp DOCUMENT,
- * so it arrives whole; Phoenix accepts it for 72 hours after it was taken.
+ * The Phoenix Camera: a live camera only (no gallery), the rep's position and time, and a seal Phoenix can check.
+ * The rep sends the file to the System Administrator as a WhatsApp DOCUMENT, so it arrives whole; Phoenix accepts it
+ * for 72 hours after it was taken.
  *
- * Indoors (a polyclinic, a pharmacy deep in a building) the satellites rarely reach. The rep takes the position at
- * the building's door, and the app HOLDS that satellite position for [HOLD_MS] while they walk in. The seal says
- * honestly how old the position was at the shutter (`fixAgeMs`) and how many satellites fixed it; it never falls
- * back to a Wi-Fi or network position, which is what fake-location tricks feed on.
+ * The rep never waits for the location (owner, 20 Nov 2026: "I don't want him to wait for the satellites ... he can
+ * take the photo now, and make sure the location is accurate, at least 98%"). The location starts when the app opens
+ * ([PositionWatch]: the phone's combined Wi-Fi, mobile-network and satellite position beside the satellites alone),
+ * the shutter is always live, and the photo is sealed with the most accurate reading around its shutter as soon as
+ * the phone is 98% sure of the place to within [EXACT_M] x 1.85 m, at worst [MAX_M] x 1.85 m. A fake-location mark
+ * on any reading, a fake-location app switched on, a rooted phone or an emulator still stop the photo.
  *
  * Dressed in the Phoenix identity: the signature card's navy, orange and cream, square corners, flat colour.
  */
 class MainActivity : ComponentActivity() {
 
     private companion object {
-        /** A position is "live" while it is this fresh. */
-        const val LIVE_MS = 15_000L
-        /** How long a satellite position taken at the door is held for a photo inside. Phoenix allows 10 minutes. */
-        const val HOLD_MS = 9 * 60_000L
-        const val MIN_SATELLITES = 4
-        const val MAX_ACCURACY_M = 150f
+        /** A reading this accurate (Android's 68% radius; 98% within about 37 m) seals the photo at once. */
+        const val EXACT_M = 20f
+        /** The least accurate reading a photo may carry (98% within about 74 m). Phoenix refuses anything wider. */
+        const val MAX_M = 40f
+        /** A reading this fresh at the shutter seals the photo at once. */
+        const val INSTANT_AGE_MS = 15_000L
+        /** After the shutter the location has this long to lock before the photo is given up. */
+        const val LOCK_WAIT_MS = 20_000L
+        /** The oldest reading a photo may carry. Phoenix allows two minutes. */
+        const val BEFORE_MS = 120_000L
     }
 
-    /** The last good satellite position, with the satellites that fixed it. */
-    private class HeldFix(val location: Location, val used: Int, val seen: Int)
+    /** What the phone knew at the instant of the shutter. */
+    private class Shot(val shutterNanos: Long, val phoneMs: Long, val satellitesUsed: Int, val satellitesSeen: Int)
 
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
-    private var watch: SatelliteWatch? = null
-    private var held: HeldFix? = null
+    private var watch: PositionWatch? = null
     private var imageCapture: ImageCapture? = null
     private var statusView: TextView? = null
     private var stateView: TextView? = null
@@ -101,12 +106,11 @@ class MainActivity : ComponentActivity() {
     private var timeValue: TextView? = null
     private var shutter: View? = null
     private var busy = false
-    private var lookingSince = 0L
     private val ticker = Handler(Looper.getMainLooper())
     // The camera screen counts every second even when the satellites send nothing, so "nothing in view" shows as such.
     private val tick = object : Runnable {
         override fun run() {
-            if (watch == null) return
+            if (statusView == null) return
             refreshStatus()
             ticker.postDelayed(this, 1_000L)
         }
@@ -154,6 +158,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         worker.execute { PhoenixClock.refresh(this) }
+        startWatch()
+    }
+
+    override fun onPause() {
+        watch?.stop()
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -168,6 +178,7 @@ class MainActivity : ComponentActivity() {
         val granted = listOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION).all {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
+        if (granted) startWatch()
         when {
             !granted -> showMessage(
                 "Camera and precise location",
@@ -271,14 +282,14 @@ class MainActivity : ComponentActivity() {
         }
         val sat = reading()
         val acc = reading()
-        val timeL = micro("Waiting", color = orange)
+        val timeL = micro("Source", color = orange)
         val timeV = reading()
         val readings = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(12), 0, dp(12))
             addView(cell(micro("Satellites", color = orange), sat))
             addView(vRule())
-            addView(cell(micro("Accuracy", color = orange), acc))
+            addView(cell(micro("98% within", color = orange), acc))
             addView(vRule())
             addView(cell(timeL, timeV))
         }
@@ -339,9 +350,7 @@ class MainActivity : ComponentActivity() {
             imageCapture = captureUse
         }, ContextCompat.getMainExecutor(this))
 
-        watch?.stop()
-        watch = SatelliteWatch(this) { runOnUiThread { refreshStatus() } }.also { it.start() }
-        lookingSince = SystemClock.elapsedRealtime()
+        startWatch()
         ticker.removeCallbacks(tick)
         ticker.post(tick)
         refreshStatus()
@@ -432,91 +441,57 @@ class MainActivity : ComponentActivity() {
 
     // ── Readiness and capture ────────────────────────────────────────────────────────────────────────────────
 
-    /** Keeps the newest good satellite position: live, from 4+ satellites, within MAX_ACCURACY_M, not mocked. */
-    private fun updateHeld(current: SatelliteWatch) {
-        val fix = current.location ?: return
-        if (current.fixAgeMs(fix) > LIVE_MS) return
-        if (current.used < MIN_SATELLITES || !fix.hasAccuracy() || fix.accuracy > MAX_ACCURACY_M) return
-        if (held?.location?.elapsedRealtimeNanos == fix.elapsedRealtimeNanos) return
-        held = HeldFix(Location(fix), current.used, current.seen)
+    private fun permitted(): Boolean = listOf(Manifest.permission.CAMERA, Manifest.permission.ACCESS_FINE_LOCATION).all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    /** The position a photo taken now would carry, or null. */
-    private fun usable(current: SatelliteWatch): HeldFix? {
-        val h = held ?: return null
-        if (current.fixAgeMs(h.location) > HOLD_MS) {
-            held = null
-            return null
-        }
-        return h
+    /** The location starts as soon as the app may read it, before the camera screen, so it is ready by the shutter. */
+    private fun startWatch() {
+        if (!permitted()) return
+        val current = watch ?: PositionWatch(this) { runOnUiThread { refreshStatus() } }.also { watch = it }
+        current.start()
     }
 
-    /** Null when a photo can be taken now; otherwise what the rep should do. */
+    /** Null when a photo can be taken now; otherwise what stops it. The location never holds the shutter back. */
     private fun blocker(): String? {
-        val current = watch ?: return "Looking for satellites…"
-        if (!current.gpsOn()) {
-            held = null
-            return "Switch Location on in the phone's settings."
-        }
-        current.location?.let {
-            if (PhoneChecks.isMock(it)) {
-                held = null
-                return "A fake-location app is giving the position. Switch it off to take the photo."
-            }
-        }
-        updateHeld(current)
-        if (usable(current) != null) return null
-        val fix = current.location ?: return waitingForFirstFix(current)
-        if (current.fixAgeMs(fix) > LIVE_MS) return waitingForFirstFix(current)
-        if (current.used < MIN_SATELLITES) {
-            return "Satellites: ${current.used} of the $MIN_SATELLITES needed. At the building's door or outside it is quickest."
-        }
-        return "The position is still rough. Step to the door or outside for a moment."
+        val current = watch ?: return "Starting the location…"
+        if (!current.locationOn()) return "Switch Location on in the phone's settings."
+        if (current.mockSeen()) return "A fake-location app is giving the position. Switch it off to take the photo."
+        if (imageCapture == null) return "Starting the camera…"
+        return null
     }
 
-    /** Before the first position: what the satellites are doing, so the rep can tell "nearly there" from "nothing". */
-    private fun waitingForFirstFix(current: SatelliteWatch): String {
-        val seconds = (SystemClock.elapsedRealtime() - lookingSince) / 1_000
-        if (current.seen == 0 && seconds >= 60) {
-            return "No satellites in view. Step to the building's door or outside under open sky; once the position is held you can go back in."
-        }
-        return "Inside a building? Take the position at the door or outside first, then go in: it is held for ${HOLD_MS / 60_000} minutes."
-    }
+    /** The reading a photo taken now would be sealed with at once, or null while the location is still settling. */
+    private fun lockedNow(current: PositionWatch): PositionWatch.Fix? =
+        current.best(SystemClock.elapsedRealtimeNanos(), INSTANT_AGE_MS, 0L)?.takeIf { it.location.accuracy <= EXACT_M }
 
     private fun refreshStatus() {
         val current = watch ?: return
+        if (statusView == null) return
         val problem = blocker()
-        val h = if (problem == null) usable(current) else null
-        val age = h?.let { current.fixAgeMs(it.location) } ?: 0L
-        val live = h != null && age <= LIVE_MS
+        val locked = lockedNow(current)
+        val shown = locked ?: current.best(SystemClock.elapsedRealtimeNanos(), INSTANT_AGE_MS, 0L) ?: current.latest()
 
-        stateDot?.background = ColorDrawable(if (h != null) orange else disabledText)
+        stateDot?.background = ColorDrawable(if (locked != null) orange else disabledText)
         stateView?.text = when {
-            h == null -> "LOOKING FOR SATELLITES"
-            live -> "READY TO SEAL · LIVE POSITION"
-            else -> "READY TO SEAL · POSITION FROM THE DOOR"
+            busy -> "SEALING THE PHOTO"
+            locked != null -> "LOCATION LOCKED"
+            shown != null -> "LOCATION SETTLING"
+            else -> "FINDING THE LOCATION"
         }
-        satValue?.text = if (h != null && !live) "${h.used} fixed" else "${current.used} / ${current.seen}"
-        val accuracy = h?.location?.accuracy ?: current.location?.takeIf { it.hasAccuracy() }?.accuracy
-        accValue?.text = accuracy?.let { "± ${it.toInt()} m" } ?: "—"
-        when {
-            h == null -> {
-                timeLabel?.text = "WAITING"
-                timeValue?.text = clock((SystemClock.elapsedRealtime() - lookingSince) / 1_000)
-            }
-            live -> {
-                timeLabel?.text = "POSITION"
-                timeValue?.text = "Live"
-            }
-            else -> {
-                timeLabel?.text = "TIME LEFT"
-                timeValue?.text = clock((HOLD_MS - age).coerceAtLeast(0) / 1_000)
-            }
+        satValue?.text = "${current.satellites.used} / ${current.satellites.seen}"
+        accValue?.text = shown?.let { "${PositionWatch.radius98(it.location.accuracy).roundToInt()} m" } ?: "—"
+        timeValue?.text = when (shown?.source) {
+            null -> "—"
+            "gps" -> "Satellites"
+            else -> "Wi-Fi + GPS"
         }
-        statusView?.text = problem ?: if (live) {
-            "Hold the phone steady and take the photo."
-        } else {
-            "Position taken ${clock(age / 1_000)} ago from ${h?.used ?: 0} satellites. Take the photo inside before the time runs out."
+        if (!busy) {
+            statusView?.text = problem ?: if (locked != null) {
+                "Take the photo."
+            } else {
+                "Take the photo now. The location locks by itself in a few seconds."
+            }
         }
         shutter?.isEnabled = problem == null && !busy
     }
@@ -525,26 +500,22 @@ class MainActivity : ComponentActivity() {
         val current = watch ?: return
         val use = imageCapture ?: return
         if (blocker() != null || busy) return
-        val chosen = usable(current) ?: return
         if (PhoneChecks.mockAppActive(this)) {
             toast("A fake-location app is switched on in this phone. Switch it off to take the photo.")
             return
         }
-        val fix = Location(chosen.location)
-        val shutterFixAge = current.fixAgeMs(fix)
-        val used = chosen.used
-        val seen = chosen.seen
+        val shot = Shot(SystemClock.elapsedRealtimeNanos(), System.currentTimeMillis(), current.satellites.used, current.satellites.seen)
         busy = true
         refreshStatus()
-        statusView?.text = "Sealing the photo…"
+        statusView?.text = "Photo taken. Locking the location…"
         use.takePicture(worker, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
-                val result = runCatching { seal(image, fix, shutterFixAge, used, seen) }
+                val photo = runCatching { Sealer.upright(image.toBitmap(), image.imageInfo.rotationDegrees) }
                 image.close()
                 runOnUiThread {
-                    busy = false
-                    result.onSuccess { showSealed(it) }.onFailure {
-                        toast("The photo could not be sealed: ${it.message ?: "try again"}")
+                    photo.onSuccess { lockThenSeal(it, shot) }.onFailure {
+                        busy = false
+                        toast("The camera did not take the photo. Try again.")
                         refreshStatus()
                     }
                 }
@@ -560,19 +531,90 @@ class MainActivity : ComponentActivity() {
         })
     }
 
-    private fun seal(image: ImageProxy, fix: Location, fixAgeMs: Long, used: Int, seen: Int): File {
-        SealKey.ensure()
-        val satelliteMs = fix.time + fixAgeMs
-        val phoneMs = System.currentTimeMillis()
-        val networkMs = PhoenixClock.nowMs(this)
-        val takenAt = Instant.ofEpochMilli(satelliteMs)
+    /**
+     * The photo is in hand. It is sealed with the most accurate reading around its shutter the moment one is exact
+     * ([EXACT_M]); after [LOCK_WAIT_MS] the best reading within [MAX_M] is taken; with none the rep is told where to
+     * stand and the photo is not kept.
+     */
+    private fun lockThenSeal(photo: Bitmap, shot: Shot) {
+        val poll = object : Runnable {
+            override fun run() {
+                val current = watch
+                if (current == null) {
+                    busy = false
+                    refreshStatus()
+                    return
+                }
+                if (current.mockSeen()) {
+                    busy = false
+                    toast("A fake-location app is giving the position. Switch it off to take the photo.")
+                    refreshStatus()
+                    return
+                }
+                val sinceMs = (SystemClock.elapsedRealtimeNanos() - shot.shutterNanos) / 1_000_000
+                val exact = current.best(shot.shutterNanos, INSTANT_AGE_MS, LOCK_WAIT_MS)?.takeIf { it.location.accuracy <= EXACT_M }
+                val best = current.best(shot.shutterNanos, BEFORE_MS, LOCK_WAIT_MS)
+                val chosen = exact ?: if (sinceMs >= LOCK_WAIT_MS) best?.takeIf { it.location.accuracy <= MAX_M } else null
+                when {
+                    chosen != null -> sealInBackground(photo, chosen, shot)
+                    sinceMs >= LOCK_WAIT_MS -> {
+                        busy = false
+                        val sure = best?.let { "The phone is only sure of the place to ${PositionWatch.radius98(it.location.accuracy).roundToInt()} m. " } ?: ""
+                        showMessage(
+                            "The location is not exact enough here",
+                            sure + "Step near a window or the door for a moment, then take the photo again.",
+                            "Back to the camera",
+                        ) { showCamera() }
+                    }
+                    else -> {
+                        statusView?.text = "Photo taken. Locking the location" +
+                            (best?.let { " · ${PositionWatch.radius98(it.location.accuracy).roundToInt()} m so far" } ?: "…")
+                        ticker.postDelayed(this, 250L)
+                    }
+                }
+            }
+        }
+        ticker.post(poll)
+    }
 
-        val upright = Sealer.upright(image.toBitmap(), image.imageInfo.rotationDegrees)
-        val stamped = Sealer.stamp(upright, listOfNotNull(
-            "${takenAt.atZone(cairo).format(stampTime)} Cairo · satellite time",
-            "%.6f, %.6f · within %d m · %d satellites".format(Locale.ENGLISH, fix.latitude, fix.longitude, fix.accuracy.toInt(), used),
+    private fun sealInBackground(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot) {
+        statusView?.text = "Sealing the photo…"
+        worker.execute {
+            val result = runCatching { seal(photo, fix, shot) }
+            runOnUiThread {
+                busy = false
+                result.onSuccess { showSealed(it) }.onFailure {
+                    toast("The photo could not be sealed: ${it.message ?: "try again"}")
+                    refreshStatus()
+                }
+            }
+        }
+    }
+
+    private fun seal(photo: Bitmap, fix: PositionWatch.Fix, shot: Shot): File {
+        SealKey.ensure()
+        val sinceShutterMs = (SystemClock.elapsedRealtimeNanos() - shot.shutterNanos) / 1_000_000
+        // Positive: the reading was taken before the shutter; negative: just after it, while the location locked.
+        val fixAgeMs = -fix.offsetMs(shot.shutterNanos)
+        val satelliteMs = SatelliteClock.utcAt(this, shot.shutterNanos)
+        val networkMs = PhoenixClock.nowMs(this)?.minus(sinceShutterMs)
+        val takenMs: Long
+        val timeSource: String
+        val timeWords: String
+        when {
+            satelliteMs != null -> { takenMs = satelliteMs; timeSource = "satellites"; timeWords = "satellite time" }
+            networkMs != null -> { takenMs = networkMs; timeSource = "phoenix"; timeWords = "Phoenix time" }
+            else -> { takenMs = shot.phoneMs; timeSource = "phone"; timeWords = "phone's clock" }
+        }
+        val takenAt = Instant.ofEpochMilli(takenMs)
+        val used = if (fix.source == "gps") fix.satellites else shot.satellitesUsed
+        val radius = PositionWatch.radius98(fix.location.accuracy).roundToInt()
+
+        val stamped = Sealer.stamp(photo, listOfNotNull(
+            "${takenAt.atZone(cairo).format(stampTime)} Cairo · $timeWords",
+            "%.6f, %.6f · 98%% within %d m".format(Locale.ENGLISH, fix.location.latitude, fix.location.longitude, radius) +
+                (if (used > 0) " · $used satellites" else ""),
             "${repName()} (${repHrId()})",
-            if (fixAgeMs > 60_000) "Position from the door, ${clock(fixAgeMs / 1_000)} before the photo" else null,
             "Phoenix Camera · sealed",
         ))
         val jpeg = Sealer.encode(stamped)
@@ -585,18 +627,18 @@ class MainActivity : ComponentActivity() {
             .put("imageSha256", Sealer.sha256Hex(jpeg))
             .put("hrId", repHrId())
             .put("repName", repName())
-            .put("lat", fix.latitude)
-            .put("lon", fix.longitude)
-            .put("accuracyMeters", fix.accuracy.toDouble())
+            .put("lat", fix.location.latitude)
+            .put("lon", fix.location.longitude)
+            .put("accuracyMeters", fix.location.accuracy.toDouble())
             .put("satellitesUsed", used)
-            .put("satellitesSeen", seen)
-            .put("provider", fix.provider ?: "gps")
+            .put("satellitesSeen", shot.satellitesSeen)
+            .put("provider", fix.source)
             .put("fixAgeMs", fixAgeMs)
             .put("takenAtUtc", takenAt.toString())
-            .put("timeSource", "satellites")
-            .put("phoneClockUtc", Instant.ofEpochMilli(phoneMs).toString())
+            .put("timeSource", timeSource)
+            .put("phoneClockUtc", Instant.ofEpochMilli(shot.phoneMs).toString())
             .put("networkTimeUtc", networkMs?.let { Instant.ofEpochMilli(it).toString() } ?: JSONObject.NULL)
-            .put("mock", PhoneChecks.isMock(fix))
+            .put("mock", fix.mock)
             .put("mockAppActive", PhoneChecks.mockAppActive(this))
             .put("rooted", PhoneChecks.rooted(this))
             .put("emulator", PhoneChecks.emulator())
@@ -629,8 +671,6 @@ class MainActivity : ComponentActivity() {
     // ── Small helpers ────────────────────────────────────────────────────────────────────────────────────────
 
     private fun stopCamera() {
-        watch?.stop()
-        watch = null
         imageCapture = null
         statusView = null
         stateView = null

@@ -55,12 +55,12 @@ jobs:
           "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
           grep -qi "certificate SHA-256 digest: $EXPECTED_CERT_SHA256" "$RUNNER_TEMP/certs.txt" \
             || { echo "The APK is not signed with the certificate Phoenix trusts."; exit 1; }
-          cp "$apk" Phoenix-Camera-1.1.0.apk
+          cp "$apk" Phoenix-Camera-1.2.0.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: Phoenix-Camera
-          path: Phoenix-Camera-1.1.0.apk
+          path: Phoenix-Camera-1.2.0.apk
           retention-days: 30
 
       - name: Remove the release key
@@ -102,7 +102,7 @@ jobs:
             adb shell dumpsys package com.satopharma.phoenixcamera | grep -E "versionCode|versionName"
             adb shell pm grant com.satopharma.phoenixcamera android.permission.CAMERA || true
             adb shell pm grant com.satopharma.phoenixcamera android.permission.ACCESS_FINE_LOCATION || true
-            adb logcat -c
+            adb logcat -c || true
             adb shell am start -W -n com.satopharma.phoenixcamera/.MainActivity
             sleep 10
             adb exec-out screencap -p > screen-api${{ matrix.api }}.png

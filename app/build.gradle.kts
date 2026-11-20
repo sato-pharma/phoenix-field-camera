@@ -15,8 +15,8 @@ android {
         applicationId = "com.satopharma.phoenixcamera"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
     }
 
     signingConfigs {
@@ -55,4 +55,6 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // The phone's combined position (Wi-Fi, mobile network, satellites): the only one that answers indoors at once.
+    implementation("com.google.android.gms:play-services-location:21.3.0")
 }

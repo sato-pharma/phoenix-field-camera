@@ -11,8 +11,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 
-/** The satellites only: GPS_PROVIDER, never the network or Wi-Fi position, and the satellite count beside it. */
-class SatelliteWatch(context: Context, private val onChange: () -> Unit) {
+/** The satellites alone (GPS_PROVIDER) and the satellite count beside it; PositionWatch runs it beside the fused position. */
+class SatelliteWatch(
+    context: Context,
+    private val onChange: () -> Unit,
+    private val onFix: (Location) -> Unit = {},
+) {
     private val manager = context.getSystemService(LocationManager::class.java)
     private val handler = Handler(Looper.getMainLooper())
 
@@ -26,6 +30,7 @@ class SatelliteWatch(context: Context, private val onChange: () -> Unit) {
     private val listener = object : LocationListener {
         override fun onLocationChanged(newLocation: Location) {
             location = newLocation
+            onFix(newLocation)
             onChange()
         }
 
