@@ -10,6 +10,9 @@ import android.graphics.Typeface
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -55,6 +58,16 @@ class MainActivity : ComponentActivity() {
     private var statusView: TextView? = null
     private var shutter: Button? = null
     private var busy = false
+    private var lookingSince = 0L
+    private val ticker = Handler(Looper.getMainLooper())
+    // The waiting screen counts the seconds even when the satellites send nothing, so "nothing in view" shows as such.
+    private val tick = object : Runnable {
+        override fun run() {
+            if (watch == null) return
+            refreshStatus()
+            ticker.postDelayed(this, 1_000L)
+        }
+    }
 
     private val cairo = ZoneId.of("Africa/Cairo")
     private val stampTime = DateTimeFormatter.ofPattern("d MMM yyyy · HH:mm:ss", Locale.ENGLISH)
@@ -153,7 +166,9 @@ class MainActivity : ComponentActivity() {
 
         watch?.stop()
         watch = SatelliteWatch(this) { runOnUiThread { refreshStatus() } }.also { it.start() }
-        refreshStatus()
+        lookingSince = SystemClock.elapsedRealtime()
+        ticker.removeCallbacks(tick)
+        ticker.post(tick)
     }
 
     private fun showPhotos() {
@@ -202,12 +217,22 @@ class MainActivity : ComponentActivity() {
     private fun blocker(): String? {
         val current = watch ?: return "Looking for satellites…"
         if (!current.gpsOn()) return "Switch Location on in the phone's settings."
-        val fix = current.location ?: return "Looking for satellites. Stand outside or next to a window."
+        val fix = current.location ?: return waitingForFirstFix(current)
         if (PhoneChecks.isMock(fix)) return "A fake-location app is giving the position. Switch it off to take the photo."
         if (current.fixAgeMs(fix) > 15_000) return "Waiting for a fresh position from the satellites…"
         if (current.used < 4) return "Satellites: ${current.used} of the 4 needed. Stand outside or next to a window."
         if (!fix.hasAccuracy() || fix.accuracy > 150f) return "The position is still rough. Stand outside or next to a window."
         return null
+    }
+
+    /** Before the first position: what the satellites are doing, so the rep can tell "nearly there" from "nothing". */
+    private fun waitingForFirstFix(current: SatelliteWatch): String {
+        val seconds = (SystemClock.elapsedRealtime() - lookingSince) / 1_000
+        if (current.seen == 0 && seconds >= 60) {
+            return "No satellites in view after ${seconds} s. A roof or window is blocking them: step outside under open sky."
+        }
+        return "Looking for satellites · ${current.seen} in view, ${current.used} in the fix · ${seconds} s.\n" +
+            "Open sky is fastest. The first position on a phone can take 1 to 3 minutes; keep the phone still."
     }
 
     private fun refreshStatus() {
