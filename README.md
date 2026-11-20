@@ -16,6 +16,16 @@ The rep never waits for the location. It starts the moment the app opens, from t
 polyclinic) beside the satellites alone, and the last ten minutes of readings are kept. The shutter is always live.
 The seal carries the reading; Phoenix reads the 98% radius (Android's own accuracy figure is a 68% radius, 1.85 times narrower).
 
+## 2.2.2
+
+- **The rep reads no location, approval or place words** (owner, 21 Nov 2026: "Fix in 2.2.2"). The camera screen says
+  READY instead of LOCATION LOCKED / SETTLING / FINDING; the Saved screen no longer says "for approval where one is
+  needed" or "Location pending"; the photo screen no longer says the customer "has no place in Phoenix yet"; the
+  Validate and Add new customer screens no longer say "goes for approval"; the permission and modified-phone messages
+  no longer say "seal". What the phone records and sends is unchanged.
+- **English sentences read left to right when they open with an Arabic customer name.** Every body text is laid out
+  left to right (`TEXT_DIRECTION_LTR`); the name itself still reads right to left inside it.
+
 ## 2.2.1
 
 - **Back and Refresh at the top of every screen** (owner, 21 Nov 2026: "make a refresh button and back button at the

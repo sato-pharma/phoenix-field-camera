@@ -338,11 +338,11 @@ class MainActivity : ComponentActivity() {
         when {
             !granted -> showMessage(
                 "Camera and precise location",
-                "The Phoenix Camera needs the camera and your precise location to seal a photo.",
+                "The Phoenix Camera needs the camera and the phone's location to take your visit photos.",
                 "Allow both",
             ) { permissions.launch(asked()) }
             PhoneChecks.rooted(this) || PhoneChecks.emulator() -> showMessage(
-                "This phone cannot seal photos",
+                "This phone cannot take Phoenix photos",
                 "Its system has been modified. Use a phone with its original system.",
                 null,
                 null,
@@ -498,7 +498,7 @@ class MainActivity : ComponentActivity() {
                 if (pack.newCustomerOptions == null) {
                     showMessage(
                         "Add a new customer",
-                        "A new customer is added from the main account, with network: there you take his place and send him for approval.",
+                        "A new customer is added from the main account, with network.",
                         "Back",
                     ) { showHome() }
                 } else {
@@ -773,7 +773,7 @@ class MainActivity : ComponentActivity() {
         render("")
         setScreen(page(
             heading("Validate a customer", "Choose the customer"),
-            body("Customers on your list with no place in Phoenix yet. Take the photo at his clinic; it goes for approval."),
+            body("Customers on your list who still need a photo of their clinic. Take the photo at the clinic."),
             gap(14),
             search,
             gap(14),
@@ -939,7 +939,7 @@ class MainActivity : ComponentActivity() {
 
         setScreen(page(
             heading("Add new customer", "The new customer"),
-            body("Fill in the customer as in the main account, then take the photo at his clinic. He goes for approval in Phoenix."),
+            body("Fill in the customer as in the main account, then take the photo at the clinic."),
             gap(16),
             micro("AM or PM"),
             gap(8),
@@ -1037,9 +1037,9 @@ class MainActivity : ComponentActivity() {
         setScreen(page(
             heading("The photo", "What will the photo show?"),
             body(if (visit.intent == "new_customer") {
-                "${visit.customerName} is a new customer. Choose what you will photograph."
+                "A new customer. Choose what you will photograph at the clinic."
             } else {
-                "${visit.customerName} has no place in Phoenix yet. Choose what you will photograph."
+                "Choose what you will photograph at the clinic."
             }),
             gap(16),
             column,
@@ -1182,11 +1182,11 @@ class MainActivity : ComponentActivity() {
             else -> "the visit and its photo are"
         }
         setScreen(page(
-            heading("Saved", if (locationPending) "Location pending" else "Saved"),
+            heading("Saved", "Saved"),
             body(if (locationPending) {
-                "${visit.customerName}: $what on the phone. The location is added by itself; keeping the app open for a moment helps. It sends itself to Phoenix when there is network, for approval where one is needed."
+                "${visit.customerName}: $what on the phone. Keep the app open for a moment. It sends itself to Phoenix when there is network; you do not need to send anything."
             } else {
-                "${visit.customerName}: $what on the phone. It sends itself to Phoenix when there is network, for approval where one is needed; you do not need to send anything."
+                "${visit.customerName}: $what on the phone. It sends itself to Phoenix when there is network; you do not need to send anything."
             }),
             gap(20),
             primaryButton("Done") { showHome() },
@@ -1263,20 +1263,17 @@ class MainActivity : ComponentActivity() {
         if (statusView == null) return
         val problem = blocker()
         val locked = lockedNow(current)
-        val shown = locked ?: current.best(SystemClock.elapsedRealtimeNanos(), INSTANT_AGE_MS, 0L) ?: current.latest()
 
         stateDot?.background = ColorDrawable(if (locked != null) orange else disabledText)
         stateView?.text = when {
             busy -> "SAVING THE VISIT"
-            locked != null -> "LOCATION LOCKED"
-            shown != null -> "LOCATION SETTLING"
-            else -> "FINDING THE LOCATION"
+            else -> "READY"
         }
         if (!busy) {
             statusView?.text = problem ?: if (locked != null) {
                 "Take the photo."
             } else {
-                "Take the photo now. The location is added by itself."
+                "Take the photo now."
             }
         }
         shutter?.isEnabled = problem == null && !busy
@@ -1613,6 +1610,9 @@ class MainActivity : ComponentActivity() {
 
     private fun body(value: String) = TextView(this).apply {
         text = value
+        // English sentences read left to right even when they open with an Arabic customer name (2.2.2).
+        textDirection = View.TEXT_DIRECTION_LTR
+        textAlignment = View.TEXT_ALIGNMENT_VIEW_START
         typeface = regular
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
         setTextColor(ink)
