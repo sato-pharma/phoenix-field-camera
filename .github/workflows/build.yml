@@ -8,6 +8,8 @@ name: build
 on:
   push:
     branches: [main]
+  # Every pull request builds, signs and installs the APK, so a change that will not install never reaches a rep.
+  pull_request:
   workflow_dispatch:
 
 permissions:
