@@ -15,8 +15,8 @@ android {
         applicationId = "com.satopharma.phoenixcamera"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 7
+        versionName = "2.2.0"
     }
 
     signingConfigs {
@@ -55,4 +55,10 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // The phone's combined position (Wi-Fi, mobile network, satellites): the only one that answers indoors at once.
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+    // play-services-location brings Fragment 1.0, too old for the permission request (lint InvalidFragmentVersionForActivityResult).
+    implementation("androidx.fragment:fragment-ktx:1.8.5")
+    // Android's own scheduler: the waiting visits send with the app closed or after a restart (2.1).
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }

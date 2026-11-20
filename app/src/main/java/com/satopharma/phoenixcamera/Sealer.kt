@@ -54,7 +54,9 @@ object Sealer {
         val lineHeight = textSize * 1.35f
         val padding = textSize * 0.6f
         val bandTop = out.height - (lines.size * lineHeight + padding * 2)
-        canvas.drawRect(0f, bandTop, out.width.toFloat(), out.height.toFloat(), Paint().apply { color = Color.argb(200, 0, 0, 0) })
+        // The Phoenix band: navy under the text, an orange rule along its top edge.
+        canvas.drawRect(0f, bandTop, out.width.toFloat(), out.height.toFloat(), Paint().apply { color = Color.argb(215, 11, 31, 58) })
+        canvas.drawRect(0f, bandTop, out.width.toFloat(), bandTop + max(2f, out.width / 400f), Paint().apply { color = Color.rgb(244, 123, 32) })
         lines.forEachIndexed { index, line ->
             canvas.drawText(line, padding, bandTop + padding + textSize + index * lineHeight, paint)
         }

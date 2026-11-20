@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Phoenix identity: the signature card's navy, orange, cream, ink and rule. Flat colour only. -->
+<resources>
+    <color name="phoenix_navy">#0B1F3A</color>
+    <color name="phoenix_orange">#F47B20</color>
+    <color name="phoenix_cream">#FDF8F3</color>
+    <color name="phoenix_ink">#2A3A5C</color>
+    <color name="phoenix_rule">#E0D0BC</color>
+</resources>
