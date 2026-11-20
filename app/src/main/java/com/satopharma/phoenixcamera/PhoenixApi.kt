@@ -59,7 +59,7 @@ object PhoenixApi {
         val expires = runCatching { Instant.parse(reply.body.optString("expiresAt")).toEpochMilli() }
             .getOrDefault(System.currentTimeMillis() + 11L * 3_600_000L)
         val user = reply.body.optJSONObject("user")
-        val id = (user?.optString("hrId") ?: hrId).trim().uppercase()
+        val id = (user?.optString("hrId")?.takeIf { it.isNotBlank() } ?: hrId).trim().uppercase()
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("token", token)
             .putLong("expiresMs", expires)
