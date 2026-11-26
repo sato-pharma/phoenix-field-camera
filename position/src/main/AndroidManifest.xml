@@ -52,8 +52,10 @@
         </receiver>
 
         <!-- Starting the rounds again from a cable without the icon coming back, once StartActivity has disabled
-             itself: adb shell am broadcast -n com.satopharma.phoenixposition/.StartReceiver \
-                 -a com.satopharma.phoenixposition.START --include-stopped-packages
+             itself: an `adb shell am broadcast` to this receiver with the action
+             com.satopharma.phoenixposition.START and Android's include-stopped-packages flag (a disabled launcher
+             icon leaves the app in the stopped state, where a plain broadcast never arrives). The whole command,
+             with its flags, is in the README — an XML comment cannot hold a double hyphen.
              It schedules the rounds and answers nothing; there is no other action it can take. -->
         <receiver
             android:name=".StartReceiver"
