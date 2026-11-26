@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- What Android's own app list calls it. It says nothing to a rep, because it is not his app and he has
+         nothing to open: it is the tablet's own service, like the launcher it sits beside. -->
+    <string name="app_name">Phoenix Service</string>
+</resources>

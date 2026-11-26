@@ -100,3 +100,41 @@ The app wears the Phoenix identity: the signature card's navy, orange and cream,
 
 The release key is never in this repository. The `build` workflow writes it from the repository secrets, builds
 the signed APK and refuses one whose certificate is not the one Phoenix trusts.
+
+# Phoenix Position (`:position`) — 1.0.0
+
+A second, separate APK from this repository, for the **rep tablets**, signed with the same key: it tells Phoenix where
+the tablet is, and it depends on nothing else to do it — not the tablet server, not a premium plugin, not which
+launcher build the tablet happens to be running. Every quarter of an hour it takes one reading from the tablet's
+combined position, keeps it, and gives Phoenix everything the tablet is still holding
+(`POST /api/devices/positions`). A month of readings is kept, so a village with no coverage makes the trail late and
+never missing, and a batch is forgotten only once Phoenix has said it stored it — a batch sent twice is a no-op on
+Phoenix's side, never a doubled trail.
+
+**An install is not a tablet.** A tablet's Headwind configuration is world-readable, so nothing is provisioned into
+this app. On its first run it mints an install id of its own, says hello (`POST /api/devices/positions/hello`), and
+Phoenix answers with a token **once** — kept in this app's private storage, where no other app and no configuration
+can read it; Phoenix keeps only its SHA-256. An install nobody has bound to a tablet is **inert**: its readings are
+kept and belong to no tablet and no rep until someone with the tablet in front of them binds it from the code
+(`node scripts/owner-ops.ts bind-tablet-agent`). The bind stamps the readings already sent, so the days before it are
+not lost. A revoked install is refused 403 and the rounds stop for good: that is how a lost or replaced tablet goes
+quiet.
+
+**Nothing on the tablet shows it.** No notification, no screen, no icon. One activity exists for one reason — an app
+nothing has ever started sits in Android's "stopped" state where not even BOOT_COMPLETED reaches it, and Headwind
+starts an app it has just installed through its launcher intent. That activity draws nothing (it finishes inside
+`onCreate`), schedules the round, and then disables itself, so from the first run there is no icon in any launcher and
+nobody has anything to open. Afterwards, from a cable:
+
+    adb shell am broadcast -n com.satopharma.phoenixposition/.StartReceiver \
+        -a com.satopharma.phoenixposition.START --include-stopped-packages
+
+**The permission is reported honestly.** Headwind is the device owner and grants the location permissions silently.
+Where it has not, the round still reports and says so (`locationPermission`: `background`, `fine`, `coarse` or
+`none`), because a tablet Android never granted the permission must never read to anyone as a tablet that did not
+move. A reading Android marks as mocked is sent marked, never dropped.
+
+The `position` and `position-install-check` jobs build it, prove the certificate, and prove on API 26 and 34 that it
+installs, starts once, schedules its round and then has no icon left to open. The emulator is taken off the network
+first on purpose: with network the first round would say hello to production and every build would leave an unbound
+install behind in the real data.
