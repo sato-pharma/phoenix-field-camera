@@ -217,13 +217,18 @@ jobs:
             adb shell pm grant com.satopharma.phoenixposition android.permission.ACCESS_COARSE_LOCATION || true
             adb shell pm grant com.satopharma.phoenixposition android.permission.ACCESS_BACKGROUND_LOCATION || true
             adb logcat -c || true
-            adb shell am start -W -n com.satopharma.phoenixposition/.StartActivity
+            # NO -W HERE, and a hard timeout. `am start -W` waits for the activity to report itself displayed and
+            # idle; StartActivity draws no window and finishes inside onCreate, so on API 26 that wait never ends —
+            # the 26 Nov 2026 run printed "Starting: Intent { … }" and then sat there until the job's own 30-minute
+            # timeout killed it (API 34's ActivityManager returns anyway). The start is fire-and-forget by design;
+            # the sleep below, the crash log and the scheduler are what prove it worked.
+            timeout 60 adb shell am start -n com.satopharma.phoenixposition/.StartActivity
             sleep 20
             adb logcat -d -b crash | tee crash.txt; test ! -s crash.txt
             # The quarter-hourly round is with Android's own scheduler.
             adb shell dumpsys jobscheduler | tee jobs.txt | grep -q com.satopharma.phoenixposition
             # And the one thing that was visible has taken itself away: starting it again resolves to nothing.
-            adb shell am start -n com.satopharma.phoenixposition/.StartActivity 2>&1 | tee second.txt
+            timeout 60 adb shell am start -n com.satopharma.phoenixposition/.StartActivity 2>&1 | tee second.txt
             grep -qiE "does not exist|disabled|unable to resolve|Error" second.txt
 
       - uses: actions/upload-artifact@v4
