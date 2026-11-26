@@ -177,8 +177,12 @@ jobs:
 
   # Proves the agent installs, starts once, schedules its quarter-hourly round, and then has no icon left to open.
   #
-  # The emulator is taken OFF the network first, on purpose: with network the first round would say hello to PRODUCTION
-  # and every build would leave an unbound install behind in the real data. Offline, the round still runs and the
+  # The emulator MUST NOT be able to reach Phoenix: the agent's first round says hello, and a build that reaches
+  # production leaves an unbound junk install in the real data. `svc data disable` and `svc wifi disable` DO NOT
+  # achieve that — they ran silently on the API 26 emulator on 26 Nov 2026 and it enrolled itself in PRODUCTION
+  # twice anyway, because qemu's user-mode network is not the mobile radio those toggles switch. So the emulator is
+  # booted with `-dns-server 127.0.0.1`: nothing in the guest can resolve a name, and the step below proves that
+  # before the APK is installed and fails the job if it ever resolves again. Offline the round still runs and the
   # scheduler still shows it, which is what this check is for.
   position-install-check:
     needs: position
@@ -208,9 +212,16 @@ jobs:
           arch: ${{ matrix.arch }}
           target: ${{ matrix.target }}
           disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -dns-server 127.0.0.1
           script: |
             adb shell svc data disable || true
             adb shell svc wifi disable || true
+            # PROVE the guest cannot resolve Phoenix, before anything is installed. A resolved name here means a
+            # junk install would land in production, so the job stops instead.
+            adb shell ping -c 1 -W 2 phoenix-hr.satopharma.com 2>&1 | tee dns.txt || true
+            cat dns.txt
+            grep -qiE "unknown host|bad address|name resolution|No address associated" dns.txt \
+              || { echo "The emulator can still resolve Phoenix — refusing to go on; this build would enrol a junk install in PRODUCTION."; exit 1; }
             adb install -r "$(ls Phoenix-Position-*.apk | head -n 1)" 2>&1 | tee install.txt; grep -q Success install.txt
             adb shell dumpsys package com.satopharma.phoenixposition | grep -E "versionCode|versionName"
             adb shell pm grant com.satopharma.phoenixposition android.permission.ACCESS_FINE_LOCATION || true
@@ -236,6 +247,7 @@ jobs:
         with:
           name: position-install-check-api${{ matrix.api }}
           path: |
+            dns.txt
             install.txt
             crash.txt
             jobs.txt
