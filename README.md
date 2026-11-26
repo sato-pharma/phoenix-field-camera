@@ -135,6 +135,9 @@ Where it has not, the round still reports and says so (`locationPermission`: `ba
 move. A reading Android marks as mocked is sent marked, never dropped.
 
 The `position` and `position-install-check` jobs build it, prove the certificate, and prove on API 26 and 34 that it
-installs, starts once, schedules its round and then has no icon left to open. The emulator is taken off the network
-first on purpose: with network the first round would say hello to production and every build would leave an unbound
-install behind in the real data.
+installs, starts once, schedules its round and then has no icon left to open. The emulator must not be able to reach
+Phoenix: the first round would say hello to production and every build would leave an unbound install behind in the
+real data. `svc data disable` does not achieve that — qemu's user-mode network is not the radio it switches, and the
+API 26 emulator enrolled itself in production twice on 26 Nov 2026 before this was understood. The emulator is now
+booted with its DNS pointed at its own loopback, so no name in the guest resolves, and the job proves that with a
+lookup of its own before it installs anything.
